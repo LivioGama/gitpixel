@@ -28,7 +28,7 @@
 //! regex verification is authoritative.
 
 use std::collections::HashMap;
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
 
@@ -38,6 +38,12 @@ pub const MAGIC: &[u8; 8] = b"GPXSHARD";
 pub const VERSION: u32 = 1;
 const HEADER_LEN: usize = 192;
 const LOOKUP_RECORD: usize = 20;
+/// Safety caps to prevent OOM / overflow on malformed shards. A real shard
+/// for a large monorepo might have ~1M files and ~10M grams; these caps are
+/// well above that while still blocking absurd header values.
+const MAX_FILE_COUNT: u32 = 1_000_000;
+const MAX_GRAM_COUNT: u64 = 268_435_456; // 256M grams
+const MAX_PATH_LEN: usize = 4096;
 
 #[derive(Debug)]
 pub enum ShardError {
@@ -142,8 +148,16 @@ impl ShardBuilder {
         if let Some(parent) = dest.parent() {
             fs::create_dir_all(parent)?;
         }
+        match fs::remove_file(&tmp) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(ShardError::Io(error)),
+        }
         {
-            let file = File::create(&tmp)?;
+            let file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&tmp)?;
             let mut w = BufWriter::new(file);
 
             // Sections are assembled in memory first (v1 simplicity; the
@@ -226,7 +240,8 @@ impl Shard {
     pub fn open(path: &Path) -> Result<Self, ShardError> {
         let file = File::open(path)?;
         let mmap = unsafe { Mmap::map(&file)? };
-        if mmap.len() < HEADER_LEN {
+        let mmap_len = mmap.len();
+        if mmap_len < HEADER_LEN {
             return Err(ShardError::Corrupt("file shorter than header"));
         }
         if &mmap[0..8] != MAGIC {
@@ -236,8 +251,9 @@ impl Shard {
         if version != VERSION {
             return Err(ShardError::VersionMismatch { found: version });
         }
-        let read_u64 =
-            |off: usize| u64::from_le_bytes(mmap[off..off + 8].try_into().unwrap()) as usize;
+        let read_u64 = |off: usize| -> usize {
+            u64::from_le_bytes(mmap[off..off + 8].try_into().unwrap()) as usize
+        };
         let oid_raw = &mmap[16..56];
         let oid_end = oid_raw.iter().position(|&b| b == 0).unwrap_or(40);
         let commit_oid = if oid_end == 0 {
@@ -256,21 +272,49 @@ impl Shard {
             .to_string();
         let file_count = u32::from_le_bytes(mmap[120..124].try_into().unwrap());
         let gram_count = u64::from_le_bytes(mmap[124..132].try_into().unwrap());
+        // Cap absurd header values to prevent OOM / overflow.
+        if file_count > MAX_FILE_COUNT {
+            return Err(ShardError::Corrupt("file_count exceeds safety cap"));
+        }
+        if gram_count > MAX_GRAM_COUNT {
+            return Err(ShardError::Corrupt("gram_count exceeds safety cap"));
+        }
         let files_off = read_u64(132);
         let files_len = read_u64(140);
         let lookup_off = read_u64(148);
         let lookup_len = read_u64(156);
         let postings_off = read_u64(164);
         let postings_len = read_u64(172);
-        if postings_off + postings_len > mmap.len()
-            || lookup_off + lookup_len > mmap.len()
-            || files_off + files_len > mmap.len()
-            || lookup_len != gram_count as usize * LOOKUP_RECORD
+        // Checked section-bounds: each offset+length must fit within the mmap
+        // and not wrap around. Use checked_add to reject overflow.
+        let check_section = |off: usize, len: usize| -> bool {
+            off.checked_add(len).is_some_and(|end| end <= mmap_len)
+        };
+        if !check_section(files_off, files_len)
+            || !check_section(lookup_off, lookup_len)
+            || !check_section(postings_off, postings_len)
         {
             return Err(ShardError::Corrupt("section bounds exceed file"));
         }
+        // lookup_len must equal gram_count * LOOKUP_RECORD; use checked_mul.
+        let expected_lookup = (gram_count as usize).checked_mul(LOOKUP_RECORD);
+        if expected_lookup != Some(lookup_len) {
+            return Err(ShardError::Corrupt("lookup length mismatch"));
+        }
+        // Sections must be in order and non-overlapping (files → lookup → postings).
+        if !(files_off >= HEADER_LEN
+            && lookup_off >= files_off + files_len
+            && postings_off >= lookup_off + lookup_len)
+        {
+            return Err(ShardError::Corrupt("sections out of order or overlapping"));
+        }
+        if file_count as usize > files_len / 4 {
+            return Err(ShardError::Corrupt(
+                "file_count exceeds file table capacity",
+            ));
+        }
 
-        // Path table is small; materialize it.
+        // Path table: cap allocation to file_count (already capped above).
         let mut files = Vec::with_capacity(file_count as usize);
         let fbuf = &mmap[files_off..files_off + files_len];
         let mut pos = 0usize;
@@ -280,7 +324,10 @@ impl Shard {
             }
             let len = u32::from_le_bytes(fbuf[pos..pos + 4].try_into().unwrap()) as usize;
             pos += 4;
-            if pos + len > fbuf.len() {
+            if len > MAX_PATH_LEN {
+                return Err(ShardError::Corrupt("file path exceeds safety cap"));
+            }
+            if pos.checked_add(len).is_none_or(|end| end > fbuf.len()) {
                 return Err(ShardError::Corrupt("truncated file path"));
             }
             let path = std::str::from_utf8(&fbuf[pos..pos + len])
@@ -328,9 +375,18 @@ impl Shard {
     /// Sorted file ids containing `hash` (empty if absent).
     pub fn postings(&self, hash: u64) -> Vec<u32> {
         let n = self.gram_count as usize;
-        let lookup = &self.mmap[self.lookup_off..self.lookup_off + n * LOOKUP_RECORD];
+        // n * LOOKUP_RECORD is already validated in open(), but guard anyway.
+        let lookup_len = match n.checked_mul(LOOKUP_RECORD) {
+            Some(len) if self.lookup_off + len <= self.mmap.len() => len,
+            _ => return Vec::new(),
+        };
+        let lookup = &self.mmap[self.lookup_off..self.lookup_off + lookup_len];
         let record_hash = |i: usize| -> u64 {
-            u64::from_le_bytes(lookup[i * LOOKUP_RECORD..i * LOOKUP_RECORD + 8].try_into().unwrap())
+            u64::from_le_bytes(
+                lookup[i * LOOKUP_RECORD..i * LOOKUP_RECORD + 8]
+                    .try_into()
+                    .unwrap(),
+            )
         };
         let (mut lo, mut hi) = (0usize, n);
         while lo < hi {
@@ -347,21 +403,39 @@ impl Shard {
         let rec = &lookup[lo * LOOKUP_RECORD..(lo + 1) * LOOKUP_RECORD];
         let off = u64::from_le_bytes(rec[8..16].try_into().unwrap()) as usize;
         let len = u32::from_le_bytes(rec[16..20].try_into().unwrap()) as usize;
-        if off + len > self.postings_len {
-            return Vec::new(); // corrupt record; fail open (no candidates)
-        }
-        let run = &self.mmap[self.postings_off + off..self.postings_off + off + len];
+        // Bounds-check the posting run against the postings section.
+        let relative_end = match off.checked_add(len) {
+            Some(end) if end <= self.postings_len => end,
+            _ => return Vec::new(), // corrupt record; fail open (no candidates)
+        };
+        let run_start = match self.postings_off.checked_add(off) {
+            Some(start) => start,
+            None => return Vec::new(),
+        };
+        let run_end = self.postings_off + relative_end;
+        let run = &self.mmap[run_start..run_end];
         let mut ids = Vec::new();
         let mut pos = 0usize;
         let mut prev = 0u32;
         while pos < run.len() {
             match read_varint(run, &mut pos) {
                 Some(delta) => {
-                    let id = if ids.is_empty() { delta } else { prev + delta };
+                    let id = if ids.is_empty() {
+                        delta
+                    } else {
+                        match prev.checked_add(delta) {
+                            Some(id) => id,
+                            None => return Vec::new(),
+                        }
+                    };
+                    // Sanity: file ids must be < file_count (already validated).
+                    if id >= self.files.len() as u32 {
+                        return Vec::new();
+                    }
                     ids.push(id);
                     prev = id;
                 }
-                None => break,
+                None => return Vec::new(),
             }
         }
         ids
@@ -439,7 +513,10 @@ mod tests {
 
         let covering = ex.covering(b"handleClick");
         let q = crate::posting::GramQuery::And(
-            covering.into_iter().map(crate::posting::GramQuery::Literal).collect(),
+            covering
+                .into_iter()
+                .map(crate::posting::GramQuery::Literal)
+                .collect(),
         );
         let candidates =
             crate::posting::resolve_query(&q, shard.file_count(), &|h| shard.postings(h));
@@ -470,5 +547,149 @@ mod tests {
             }
             std::fs::remove_dir_all(&dir).ok();
         }
+    }
+
+    /// Regression: a malformed shard file must be rejected gracefully, not
+    /// crash or OOM. Test various forms of corruption.
+    #[test]
+    fn malformed_shard_rejected_gracefully() {
+        let dir = std::env::temp_dir().join(format!("gpx-shard-mal-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // 1. Truncated header (< 192 bytes).
+        let p = dir.join("trunc.bin");
+        std::fs::write(&p, b"GPXSHARD\x00\x00").unwrap();
+        assert!(Shard::open(&p).is_err(), "truncated header must reject");
+
+        // 2. Bad magic.
+        let p = dir.join("badmagic.bin");
+        let mut buf = vec![0u8; 192];
+        buf[0..8].copy_from_slice(b"BADMAGIC");
+        std::fs::write(&p, &buf).unwrap();
+        assert!(Shard::open(&p).is_err(), "bad magic must reject");
+
+        // 3. Absurd file_count (would cause OOM via Vec::with_capacity).
+        let p = dir.join("huge_count.bin");
+        let mut buf = vec![0u8; 192];
+        buf[0..8].copy_from_slice(MAGIC);
+        buf[8..12].copy_from_slice(&VERSION.to_le_bytes());
+        // file_count = u32::MAX
+        buf[120..124].copy_from_slice(&u32::MAX.to_le_bytes());
+        std::fs::write(&p, &buf).unwrap();
+        assert!(
+            Shard::open(&p).is_err(),
+            "absurd file_count must reject (not OOM)"
+        );
+
+        // 4. Absurd gram_count (would cause overflow in lookup_len calc).
+        let p = dir.join("huge_gram.bin");
+        let mut buf = vec![0u8; 192];
+        buf[0..8].copy_from_slice(MAGIC);
+        buf[8..12].copy_from_slice(&VERSION.to_le_bytes());
+        buf[120..124].copy_from_slice(&1u32.to_le_bytes()); // file_count = 1
+        buf[124..132].copy_from_slice(&u64::MAX.to_le_bytes()); // gram_count = MAX
+        std::fs::write(&p, &buf).unwrap();
+        assert!(
+            Shard::open(&p).is_err(),
+            "absurd gram_count must reject (not overflow)"
+        );
+
+        // 5. Section bounds exceeding file size.
+        let p = dir.join("oob.bin");
+        let mut buf = vec![0u8; 192];
+        buf[0..8].copy_from_slice(MAGIC);
+        buf[8..12].copy_from_slice(&VERSION.to_le_bytes());
+        buf[120..124].copy_from_slice(&1u32.to_le_bytes());
+        buf[124..132].copy_from_slice(&1u64.to_le_bytes()); // gram_count = 1
+        buf[132..140].copy_from_slice(&1000u64.to_le_bytes()); // files_off = 1000 (beyond file)
+        std::fs::write(&p, &buf).unwrap();
+        assert!(
+            Shard::open(&p).is_err(),
+            "out-of-bounds section must reject"
+        );
+
+        // 6. Plausible count with no room for even the path-length prefixes.
+        let p = dir.join("impossible_file_count.bin");
+        let mut buf = vec![0u8; 192];
+        buf[0..8].copy_from_slice(MAGIC);
+        buf[8..12].copy_from_slice(&VERSION.to_le_bytes());
+        buf[120..124].copy_from_slice(&MAX_FILE_COUNT.to_le_bytes());
+        buf[132..140].copy_from_slice(&(HEADER_LEN as u64).to_le_bytes());
+        buf[148..156].copy_from_slice(&(HEADER_LEN as u64).to_le_bytes());
+        buf[164..172].copy_from_slice(&(HEADER_LEN as u64).to_le_bytes());
+        std::fs::write(&p, &buf).unwrap();
+        assert!(
+            Shard::open(&p).is_err(),
+            "file_count larger than its table can encode must reject"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn corrupt_posting_cannot_escape_section_or_overflow_delta() {
+        let dir =
+            std::env::temp_dir().join(format!("gpx-shard-posting-mal-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("shard.bin");
+        let mut builder = ShardBuilder::new("test");
+        builder.add_file("a", vec![7]);
+        builder.add_file("b", vec![7]);
+        builder.write(&path).unwrap();
+
+        let mut bytes = std::fs::read(&path).unwrap();
+        let lookup_off = u64::from_le_bytes(bytes[148..156].try_into().unwrap()) as usize;
+        let postings_len = u64::from_le_bytes(bytes[172..180].try_into().unwrap()) as usize;
+        bytes.extend_from_slice(&[0]);
+        bytes[lookup_off + 8..lookup_off + 16]
+            .copy_from_slice(&(postings_len as u64).to_le_bytes());
+        bytes[lookup_off + 16..lookup_off + 20].copy_from_slice(&1u32.to_le_bytes());
+        std::fs::write(&path, &bytes).unwrap();
+        let shard = Shard::open(&path).unwrap();
+        assert!(
+            shard.postings(7).is_empty(),
+            "posting must not read appended bytes"
+        );
+        drop(shard);
+
+        let overflow_run = [1, 0xff, 0xff, 0xff, 0xff, 0x0f];
+        let overflow_off = postings_len;
+        bytes.truncate(bytes.len() - 1);
+        bytes.extend_from_slice(&overflow_run);
+        bytes[172..180]
+            .copy_from_slice(&((postings_len + overflow_run.len()) as u64).to_le_bytes());
+        bytes[lookup_off + 8..lookup_off + 16]
+            .copy_from_slice(&(overflow_off as u64).to_le_bytes());
+        bytes[lookup_off + 16..lookup_off + 20]
+            .copy_from_slice(&(overflow_run.len() as u32).to_le_bytes());
+        std::fs::write(&path, &bytes).unwrap();
+        let shard = Shard::open(&path).unwrap();
+        assert!(
+            shard.postings(7).is_empty(),
+            "delta overflow must fail closed"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn write_replaces_temp_symlink_without_touching_target() {
+        use std::os::unix::fs::symlink;
+
+        let dir = std::env::temp_dir().join(format!("gpx-shard-link-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        let external = dir.join("external.txt");
+        std::fs::write(&external, b"unchanged").unwrap();
+        let dest = dir.join("index.shard");
+        symlink(&external, dest.with_extension("tmp")).unwrap();
+
+        let mut builder = ShardBuilder::new("trigram");
+        builder.add_file("a.rs", vec![7]);
+        builder.write(&dest).unwrap();
+
+        assert_eq!(std::fs::read(&external).unwrap(), b"unchanged");
+        assert_eq!(Shard::open(&dest).unwrap().file_count(), 1);
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

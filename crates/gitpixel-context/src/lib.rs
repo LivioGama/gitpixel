@@ -43,6 +43,21 @@ impl Layer {
             Layer::L0 => None,
         }
     }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Layer::L0 => "L0",
+            Layer::L1 => "L1",
+            Layer::L2 => "L2",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct FitResult {
+    pub text: String,
+    pub layer: Layer,
+    pub elided_items: usize,
 }
 
 /// Rough token estimation: ~4 bytes per token (GPT/Claude average), ceiling.
@@ -88,12 +103,24 @@ pub fn render(items: &[ContextItem], layer: Layer) -> String {
 /// truncate items (keeping input order) and append an elision marker line
 /// `… N more items elided (budget)`.
 pub fn fit_to_budget(items: &[ContextItem], budget_tokens: usize, layer: Layer) -> String {
+    fit_to_budget_detailed(items, budget_tokens, layer).text
+}
+
+pub fn fit_to_budget_detailed(
+    items: &[ContextItem],
+    budget_tokens: usize,
+    layer: Layer,
+) -> FitResult {
     // 1. Degrade layers until one fits (or we bottom out at L0).
     let mut current = layer;
     loop {
         let rendered = render(items, current);
         if estimate_tokens(&rendered) <= budget_tokens {
-            return rendered;
+            return FitResult {
+                text: rendered,
+                layer: current,
+                elided_items: 0,
+            };
         }
         match current.degrade() {
             Some(next) => current = next,
@@ -125,7 +152,11 @@ pub fn fit_to_budget(items: &[ContextItem], budget_tokens: usize, layer: Layer) 
     if elided > 0 {
         out.push_str(&format!("… {elided} more items elided (budget)\n"));
     }
-    out
+    FitResult {
+        text: out,
+        layer: Layer::L0,
+        elided_items: elided,
+    }
 }
 
 #[cfg(test)]
@@ -169,6 +200,10 @@ mod tests {
         assert!(tiny.contains("more items elided (budget)"));
         assert!(estimate_tokens(&tiny) <= l0_tokens - 5);
         assert!(tiny.starts_with("src/mod_0.rs:"));
+
+        let detailed = fit_to_budget_detailed(&items, l1_tokens, Layer::L2);
+        assert_eq!(detailed.layer, Layer::L1);
+        assert_eq!(detailed.elided_items, 0);
     }
 
     #[test]
@@ -177,7 +212,8 @@ mod tests {
         let a = render(&items, Layer::L2);
         let b = render(&items, Layer::L2);
         assert_eq!(a, b);
-        let expected_first = "src/a.rs:10-13 fn alpha — fn alpha(input: &str) -> Result<Output, Error>\n";
+        let expected_first =
+            "src/a.rs:10-13 fn alpha — fn alpha(input: &str) -> Result<Output, Error>\n";
         assert!(a.starts_with(expected_first));
         // Order preserved.
         assert!(a.find("alpha").unwrap() < a.find("beta").unwrap());

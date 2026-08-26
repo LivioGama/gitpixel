@@ -126,7 +126,7 @@ fn class_alternatives(class: &Class) -> Option<Vec<Vec<u8>>> {
             let mut alts = Vec::new();
             for range in b.ranges() {
                 let (lo, hi) = (range.start(), range.end());
-                if usize::from(hi - lo) + alts.len() >= MAX_CLASS_EXPANSION + 1 {
+                if usize::from(hi - lo) + alts.len() > MAX_CLASS_EXPANSION {
                     return None;
                 }
                 for byte in lo..=hi {
@@ -139,7 +139,7 @@ fn class_alternatives(class: &Class) -> Option<Vec<Vec<u8>>> {
             let mut alts: Vec<Vec<u8>> = Vec::new();
             for range in u.ranges() {
                 let (lo, hi) = (range.start() as u32, range.end() as u32);
-                if (hi - lo) as usize + alts.len() >= MAX_CLASS_EXPANSION + 1 {
+                if (hi - lo) as usize + alts.len() > MAX_CLASS_EXPANSION {
                     return None;
                 }
                 for cp in lo..=hi {
@@ -272,7 +272,10 @@ mod tests {
 
     #[test]
     fn plain_literal_narrows() {
-        assert!(matches!(plan("handleClick"), GramQuery::And(_) | GramQuery::Literal(_)));
+        assert!(matches!(
+            plan("handleClick"),
+            GramQuery::And(_) | GramQuery::Literal(_)
+        ));
     }
 
     #[test]
@@ -318,7 +321,10 @@ mod tests {
     #[test]
     fn case_insensitive_ascii_still_narrows() {
         let q = plan("(?i)error");
-        assert!(q != GramQuery::All, "small-class expansion should narrow (?i)");
+        assert!(
+            q != GramQuery::All,
+            "small-class expansion should narrow (?i)"
+        );
     }
 
     /// Soundness: every document the regex matches must be a candidate.

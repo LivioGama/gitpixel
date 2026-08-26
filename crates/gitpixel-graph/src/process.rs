@@ -41,14 +41,38 @@ fn humanize(name: &str) -> String {
 }
 
 /// Entry points: symbols with ≥1 outgoing `calls` edge and 0 incoming `calls`
-/// edges, highest out-degree first.
+/// edges, highest out-degree first. Test functions and common framework
+/// boilerplate are excluded so discovered processes represent real execution
+/// flows, not test harnesses.
 fn entry_points(store: &GraphStore, limit: usize) -> Result<Vec<i64>, StoreError> {
     let mut stmt = store.conn().prepare(
         "SELECT s.id,
                 (SELECT COUNT(*) FROM edges e WHERE e.src_id = s.id AND e.kind = 'calls') AS outd
          FROM symbols s
+         JOIN files f ON f.id = s.file_id
          WHERE outd > 0
            AND NOT EXISTS (SELECT 1 FROM edges e2 WHERE e2.dst_id = s.id AND e2.kind = 'calls')
+           AND NOT (
+             -- Exclude test functions: name-based heuristic.
+             s.name LIKE 'test_%' OR s.name LIKE 'test%' OR s.name LIKE '%_test'
+             OR s.name LIKE '%Test' OR s.name LIKE '%_tests' OR s.name LIKE '%Tests'
+             OR s.name LIKE 'it_%' OR s.name LIKE 'it%' OR s.name LIKE 'spec_%'
+             OR s.name LIKE 'should_%' OR s.name LIKE 'expect_%'
+           )
+           AND f.path NOT LIKE 'tests/%'
+           AND f.path NOT LIKE '%/tests/%'
+           AND f.path NOT LIKE 'test/%'
+           AND f.path NOT LIKE '%/test/%'
+           AND f.path NOT LIKE '%/__tests__/%'
+           AND f.path NOT LIKE 'benches/%'
+           AND f.path NOT LIKE '%/benches/%'
+           AND f.path NOT LIKE '%.test.ts'
+           AND f.path NOT LIKE '%.test.tsx'
+           AND f.path NOT LIKE '%.spec.ts'
+           AND f.path NOT LIKE '%.spec.tsx'
+           AND f.path NOT LIKE '%_test.go'
+           AND f.path NOT LIKE 'test_%.py'
+           AND f.path NOT LIKE '%/test_%.py'
          ORDER BY outd DESC, s.id ASC
          LIMIT ?1",
     )?;
@@ -171,23 +195,52 @@ pub fn discover(
     Ok(summaries)
 }
 
-/// List persisted processes with their ordered steps.
-pub fn list(store: &GraphStore) -> Result<Vec<ProcessSummary>, StoreError> {
-    let mut stmt = store
+/// List at most `process_limit` persisted processes and at most `step_limit`
+/// ordered steps per process. The returned total is the number of persisted
+/// processes before limiting.
+pub fn list(
+    store: &GraphStore,
+    process_limit: usize,
+    step_limit: usize,
+    offset: usize,
+) -> Result<(Vec<ProcessSummary>, usize), StoreError> {
+    let total = store
         .conn()
-        .prepare("SELECT id, label, entry_symbol_id, step_count FROM processes ORDER BY id")?;
-    let rows = stmt.query_map([], |r| {
-        Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?, r.get::<_, i64>(3)?))
-    })?;
+        .query_row("SELECT COUNT(*) FROM processes", [], |r| r.get::<_, i64>(0))?
+        .max(0) as usize;
+    let mut stmt = store.conn().prepare(
+        "SELECT id, label, entry_symbol_id, step_count
+             FROM processes ORDER BY id LIMIT ?1 OFFSET ?2",
+    )?;
+    let rows = stmt.query_map(
+        params![
+            process_limit.min(i64::MAX as usize) as i64,
+            offset.min(i64::MAX as usize) as i64
+        ],
+        |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, i64>(2)?,
+                r.get::<_, i64>(3)?,
+            ))
+        },
+    )?;
     let procs: Vec<(i64, String, i64, i64)> = rows.collect::<std::result::Result<_, _>>()?;
 
     let mut out = Vec::with_capacity(procs.len());
     for (pid, label, entry_id, step_count) in procs {
-        let entry_uid = symbol_by_id(store, entry_id)?.map(|s| s.uid).unwrap_or_default();
+        let entry_uid = symbol_by_id(store, entry_id)?
+            .map(|s| s.uid)
+            .unwrap_or_default();
         let mut sstmt = store.conn().prepare(
-            "SELECT symbol_id FROM process_steps WHERE process_id = ?1 ORDER BY step",
+            "SELECT symbol_id FROM process_steps
+                 WHERE process_id = ?1 ORDER BY step LIMIT ?2",
         )?;
-        let srows = sstmt.query_map(params![pid], |r| r.get::<_, i64>(0))?;
+        let srows = sstmt.query_map(
+            params![pid, step_limit.min(i64::MAX as usize) as i64],
+            |r| r.get::<_, i64>(0),
+        )?;
         let ids: Vec<i64> = srows.collect::<std::result::Result<_, _>>()?;
         let steps_pairs: Vec<(i64, Option<EdgeKind>)> = ids
             .iter()
@@ -195,7 +248,13 @@ pub fn list(store: &GraphStore) -> Result<Vec<ProcessSummary>, StoreError> {
             .map(|(i, &id)| (id, if i == 0 { None } else { Some(EdgeKind::Calls) }))
             .collect();
         let steps = hops_for(store, &steps_pairs)?;
-        out.push(ProcessSummary { id: pid, label, entry_uid, step_count: step_count as u32, steps });
+        out.push(ProcessSummary {
+            id: pid,
+            label,
+            entry_uid,
+            step_count: step_count as u32,
+            steps,
+        });
     }
-    Ok(out)
+    Ok((out, total))
 }

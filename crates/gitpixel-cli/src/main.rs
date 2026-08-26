@@ -3,6 +3,7 @@
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
@@ -11,12 +12,16 @@ use clap::{Parser, Subcommand, ValueEnum};
 use gitpixel_core::index::{build, shard_path};
 use gitpixel_core::shard::Shard;
 use gitpixel_core::{Crc32Weigher, GramExtractor, SparseGramExtractor, TrigramExtractor};
-use gitpixel_serve::api::{Request, Response, Service};
+use gitpixel_serve::api::{PROTOCOL_VERSION, Request, Response, Service};
 use gitpixel_serve::daemon;
 use serde_json::Value;
 
 #[derive(Parser)]
-#[command(name = "gitpixel", version, about = "Fast, fresh code retrieval for agents")]
+#[command(
+    name = "gitpixel",
+    version,
+    about = "Fast, fresh code retrieval for agents"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -52,17 +57,26 @@ enum Command {
         #[arg(long, default_value_t = gitpixel_core::gram::DEFAULT_MAX_GRAM)]
         max_gram: usize,
     },
-    /// Search the indexed tree with a regex pattern.
+    /// Search the indexed tree with a regex pattern. Accepts any number of
+    /// paths (repo roots, subdirectories, or files) — ripgrep-style; the repo
+    /// root is discovered automatically for each.
     Search {
         pattern: String,
+        /// Paths to search: repo roots, subdirectories, or files (any mix).
         #[arg(default_value = ".")]
-        path: PathBuf,
+        paths: Vec<PathBuf>,
         /// Emit ndjson matches instead of text lines.
         #[arg(long)]
         json: bool,
         /// Print candidate/timing stats to stderr.
         #[arg(long)]
         stats: bool,
+        /// Maximum matching lines to return (hard-capped at 10,000).
+        #[arg(long)]
+        limit: Option<usize>,
+        /// Skip this many matching lines for page-wise retrieval.
+        #[arg(long, default_value_t = 0)]
+        offset: usize,
         /// Skip the daemon even if one is running.
         #[arg(long)]
         no_daemon: bool,
@@ -104,6 +118,9 @@ enum Command {
         path: PathBuf,
         #[arg(long, value_enum, default_value = "callers")]
         role: RoleArg,
+        /// Skip this many relationships for page-wise retrieval.
+        #[arg(long, default_value_t = 0)]
+        offset: usize,
         #[arg(long)]
         json: bool,
     },
@@ -120,6 +137,8 @@ enum Command {
     Processes {
         #[arg(default_value = ".")]
         path: PathBuf,
+        #[arg(long, default_value_t = 0)]
+        offset: usize,
         #[arg(long)]
         json: bool,
     },
@@ -127,6 +146,8 @@ enum Command {
     Clusters {
         #[arg(default_value = ".")]
         path: PathBuf,
+        #[arg(long, default_value_t = 0)]
+        offset: usize,
         #[arg(long)]
         json: bool,
     },
@@ -136,6 +157,8 @@ enum Command {
         path: PathBuf,
         #[arg(long)]
         base: Option<String>,
+        #[arg(long, default_value_t = 0)]
+        offset: usize,
         #[arg(long)]
         json: bool,
     },
@@ -150,6 +173,16 @@ enum Command {
     Status {
         #[arg(default_value = ".")]
         path: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Make a repository ready for agent work: index, graph, and warm daemon.
+    Ready {
+        #[arg(default_value = ".")]
+        path: PathBuf,
+        /// Build indexes only; do not start or use the background daemon.
+        #[arg(long)]
+        no_daemon: bool,
         #[arg(long)]
         json: bool,
     },
@@ -206,26 +239,41 @@ fn roundtrip(stream: &mut UnixStream, req: &Request) -> Option<Response> {
 fn try_daemon(root: &Path, req: &Request) -> Option<Response> {
     let sock = daemon::socket_path(root);
     let mut stream = UnixStream::connect(&sock).ok()?;
-    stream.set_read_timeout(Some(Duration::from_millis(100))).ok()?;
-    stream.set_write_timeout(Some(Duration::from_millis(100))).ok()?;
+    stream
+        .set_read_timeout(Some(Duration::from_millis(100)))
+        .ok()?;
+    stream
+        .set_write_timeout(Some(Duration::from_millis(100)))
+        .ok()?;
     let ping = roundtrip(&mut stream, &Request::Ping)?;
-    if !ping.ok {
+    if !ping.ok
+        || ping.data.get("protocol_version").and_then(Value::as_u64) != Some(PROTOCOL_VERSION)
+    {
+        // Old daemons must not serve stale schemas to a newer CLI. They all
+        // understand Shutdown; close them and use the current in-process
+        // service for this command. A later explicit start launches current.
+        let _ = roundtrip(&mut stream, &Request::Shutdown);
         return None;
     }
     // Real request may legitimately take a while (lazy graph build).
-    stream.set_read_timeout(Some(Duration::from_secs(600))).ok()?;
-    stream.set_write_timeout(Some(Duration::from_secs(30))).ok()?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(600)))
+        .ok()?;
+    stream
+        .set_write_timeout(Some(Duration::from_secs(30)))
+        .ok()?;
     roundtrip(&mut stream, req)
 }
 
-/// Prefer the daemon; fall back to an in-process Service.
-fn execute(root: &Path, req: Request, no_daemon: bool) -> Result<Value, String> {
-    if !no_daemon {
-        if let Some(resp) = try_daemon(root, &req) {
-            return unwrap_response(resp);
-        }
+/// Prefer the daemon; fall back to an in-process Service. The given path may
+/// be anywhere inside a repo — the root is discovered automatically, so
+/// pointing any command at a subdirectory or file just works.
+fn execute(path: &Path, req: Request, no_daemon: bool) -> Result<Value, String> {
+    let root = discover_root(path)?;
+    if !no_daemon && let Some(resp) = try_daemon(&root, &req) {
+        return unwrap_response(resp);
     }
-    let mut svc = Service::open(root).map_err(|e| e.to_string())?;
+    let mut svc = Service::open(&root).map_err(|e| e.to_string())?;
     unwrap_response(svc.handle(req))
 }
 
@@ -244,36 +292,52 @@ fn announce_graph_build(data: &Value) {
     }
 }
 
-fn print_data(data: &Value, raw_json: bool) {
-    if raw_json {
-        println!("{}", serde_json::to_string(data).unwrap_or_default());
-    } else {
-        println!("{}", serde_json::to_string_pretty(data).unwrap_or_default());
+fn write_stdout(text: &str) -> Result<(), String> {
+    match std::io::stdout().write_all(text.as_bytes()) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
+        Err(error) => Err(format!("write stdout: {error}")),
     }
 }
 
+fn print_data(data: &Value, raw_json: bool) -> Result<(), String> {
+    let mut output = if raw_json {
+        serde_json::to_string(data).unwrap_or_default()
+    } else {
+        serde_json::to_string_pretty(data).unwrap_or_default()
+    };
+    output.push('\n');
+    write_stdout(&output)
+}
+
 /// Shared graph-command epilogue: candidates protocol + build announcement.
-fn finish_graph_cmd(data: Value, raw_json: bool, pretty: impl Fn(&Value) -> Option<()>) {
+fn finish_graph_cmd(
+    data: Value,
+    raw_json: bool,
+    pretty: impl Fn(&Value) -> Option<String>,
+) -> Result<(), String> {
     announce_graph_build(&data);
     if raw_json {
-        print_data(&data, true);
-        return;
+        return print_data(&data, true);
     }
     if let Some(cands) = data.get("candidates").and_then(Value::as_array) {
         eprintln!("ambiguous name — re-run with one of these uids:");
+        let mut output = String::new();
         for c in cands {
-            println!(
-                "  {}  ({} {}:{})",
+            output.push_str(&format!(
+                "  {}  ({} {}:{})\n",
                 c.get("uid").and_then(Value::as_str).unwrap_or("?"),
                 c.get("kind").and_then(Value::as_str).unwrap_or("?"),
                 c.get("path").and_then(Value::as_str).unwrap_or("?"),
                 c.get("start_line").and_then(Value::as_u64).unwrap_or(0),
-            );
+            ));
         }
-        return;
+        return write_stdout(&output);
     }
-    if pretty(&data).is_none() {
-        print_data(&data, false);
+    if let Some(output) = pretty(&data) {
+        write_stdout(&output)
+    } else {
+        print_data(&data, false)
     }
 }
 
@@ -290,10 +354,52 @@ fn symbol_line(s: &Value) -> String {
 }
 
 fn envelope_note(data: &Value) {
-    if let Some(env) = data.get("envelope") {
-        if env.get("lower_bound").and_then(Value::as_bool).unwrap_or(false) {
-            let n = env.get("unresolved_same_name").and_then(Value::as_u64).unwrap_or(0);
-            eprintln!("note: lower bound — {n} same-name call site(s) unresolved");
+    if let Some(env) = data.get("envelope")
+        && env
+            .get("lower_bound")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+    {
+        let n = env
+            .get("unresolved_same_name")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        eprintln!("note: lower bound — {n} same-name call site(s) unresolved");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// repo-root discovery
+// ---------------------------------------------------------------------------
+
+/// Walk up from `path` (file or directory) to the nearest ancestor holding a
+/// `.gitpixel` index or a `.git` dir/file (worktrees). Falls back to the
+/// starting directory. This lets every command accept a subdirectory or file
+/// where an LLM would naturally point it, instead of requiring the repo root.
+fn discover_root(path: &Path) -> Result<PathBuf, String> {
+    let abs = path
+        .canonicalize()
+        .map_err(|e| format!("bad path {}: {e}", path.display()))?;
+    let start = if abs.is_file() {
+        abs.parent().map(Path::to_path_buf).unwrap_or_else(|| abs.clone())
+    } else {
+        abs.clone()
+    };
+    // The nearest `.git` defines the repo boundary and always wins — a
+    // nested `.gitpixel` left behind by indexing a subdirectory must never
+    // shadow the real repo root. `.gitpixel` alone only anchors non-git trees.
+    let mut nearest_index: Option<PathBuf> = None;
+    let mut cur = start.clone();
+    loop {
+        if cur.join(".git").exists() {
+            return Ok(cur);
+        }
+        if nearest_index.is_none() && cur.join(gitpixel_core::index::SHARD_DIR).is_dir() {
+            nearest_index = Some(cur.clone());
+        }
+        match cur.parent() {
+            Some(p) => cur = p.to_path_buf(),
+            None => return Ok(nearest_index.unwrap_or(start)),
         }
     }
 }
@@ -318,64 +424,172 @@ fn extractor_for_shard(shard: &Shard) -> Result<Box<dyn GramExtractor>, String> 
     if id == "trigram" {
         return Ok(Box::new(TrigramExtractor));
     }
-    if let Some(rest) = id.strip_prefix("sparse-crc32-") {
-        if let Some((min, max)) = rest.split_once('-') {
-            if let (Ok(min), Ok(max)) = (min.parse::<usize>(), max.parse::<usize>()) {
-                return Ok(Box::new(SparseGramExtractor::with_lengths(Crc32Weigher, min, max)));
-            }
-        }
+    if let Some(rest) = id.strip_prefix("sparse-crc32-")
+        && let Some((min, max)) = rest.split_once('-')
+        && let (Ok(min), Ok(max)) = (min.parse::<usize>(), max.parse::<usize>())
+    {
+        return Ok(Box::new(SparseGramExtractor::with_lengths(
+            Crc32Weigher,
+            min,
+            max,
+        )));
     }
-    Err(format!("index built with unsupported extractor {id:?}; re-run `gitpixel index`"))
+    Err(format!(
+        "index built with unsupported extractor {id:?}; re-run `gitpixel index`"
+    ))
 }
 
-fn print_search_matches(matches: &[Value], json: bool) {
-    let mut stdout = String::with_capacity(matches.len() * 80);
+fn print_search_matches(matches: &[Value], json: bool) -> Result<(), String> {
+    let mut output = String::with_capacity(matches.len() * 80);
     for m in matches {
         let path = m.get("path").and_then(Value::as_str).unwrap_or("");
         let line = m.get("line").and_then(Value::as_u64).unwrap_or(0);
         let text = m.get("text").and_then(Value::as_str).unwrap_or("");
         if json {
-            stdout.push_str(
+            output.push_str(
                 &serde_json::json!({"path": path, "line": line, "text": text}).to_string(),
             );
-            stdout.push('\n');
+            output.push('\n');
         } else {
-            stdout.push_str(&format!("{path}:{line}:{text}\n"));
+            output.push_str(&format!("{path}:{line}:{text}\n"));
         }
     }
-    print!("{stdout}");
+    match std::io::stdout().write_all(output.as_bytes()) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
+        Err(error) => Err(format!("write search results: {error}")),
+    }
+}
+
+/// Group user-supplied paths by their discovered repo root, mapping each to a
+/// repo-relative prefix ("" = whole repo).
+fn group_by_root(paths: &[PathBuf]) -> Result<Vec<(PathBuf, Vec<String>)>, String> {
+    let mut groups: Vec<(PathBuf, Vec<String>)> = Vec::new();
+    for p in paths {
+        let abs = p
+            .canonicalize()
+            .map_err(|e| format!("bad path {}: {e}", p.display()))?;
+        let root = discover_root(&abs)?;
+        let rel = abs
+            .strip_prefix(&root)
+            .map(|r| r.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        match groups.iter_mut().find(|(r, _)| *r == root) {
+            Some((_, rels)) => {
+                if rel.is_empty() {
+                    rels.clear();
+                    rels.push(String::new());
+                } else if !rels.iter().any(String::is_empty) {
+                    rels.push(rel);
+                }
+            }
+            None => groups.push((root, vec![rel])),
+        }
+    }
+    Ok(groups)
 }
 
 fn run_search(
     pattern: String,
-    path: PathBuf,
+    paths: Vec<PathBuf>,
     json: bool,
     stats: bool,
+    limit: Option<usize>,
+    offset: usize,
+    no_daemon: bool,
+) -> Result<(), String> {
+    let groups = group_by_root(&paths)?;
+    let multi_root = groups.len() > 1;
+    for (root, rels) in groups {
+        let whole_repo = rels.iter().any(String::is_empty);
+        let req_paths = if whole_repo { None } else { Some(rels) };
+        run_search_one(
+            &pattern, &root, req_paths, multi_root, json, stats, limit, offset, no_daemon,
+        )?;
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_search_one(
+    pattern: &str,
+    root: &Path,
+    req_paths: Option<Vec<String>>,
+    qualify: bool,
+    json: bool,
+    stats: bool,
+    limit: Option<usize>,
+    offset: usize,
     no_daemon: bool,
 ) -> Result<(), String> {
     // Fast path via daemon/service (index auto-built if missing).
     let data = execute(
-        &path,
-        Request::Search { pattern: pattern.clone(), json, limit: None },
+        root,
+        Request::Search {
+            pattern: pattern.to_string(),
+            json,
+            limit,
+            offset: Some(offset),
+            paths: req_paths,
+        },
         no_daemon,
     )?;
     let empty = Vec::new();
-    let matches = data.get("matches").and_then(Value::as_array).unwrap_or(&empty);
-    print_search_matches(matches, json);
-    if stats {
-        if let Some(s) = data.get("stats") {
-            eprintln!(
-                "candidates={}{} matches={} elapsed_us={}",
-                s.get("candidates").and_then(Value::as_u64).unwrap_or(0),
-                if s.get("scanned_all").and_then(Value::as_bool).unwrap_or(false) {
-                    " (full scan)"
-                } else {
-                    ""
-                },
-                s.get("matches").and_then(Value::as_u64).unwrap_or(0),
-                s.get("elapsed_us").and_then(Value::as_u64).unwrap_or(0),
-            );
-        }
+    let matches = data
+        .get("matches")
+        .and_then(Value::as_array)
+        .unwrap_or(&empty);
+    if qualify {
+        // Multiple repos in one invocation: qualify paths with the root so
+        // output lines stay unambiguous.
+        let qualified: Vec<Value> = matches
+            .iter()
+            .map(|m| {
+                let mut m = m.clone();
+                if let Some(rel) = m.get("path").and_then(Value::as_str) {
+                    let full = root.join(rel).display().to_string();
+                    m["path"] = Value::String(full);
+                }
+                m
+            })
+            .collect();
+        print_search_matches(&qualified, json)?;
+    } else {
+        print_search_matches(matches, json)?;
+    }
+    // Warn the user when results were truncated so the default row cap
+    // is never a surprise.
+    let truncated = data
+        .get("truncated")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let match_count = data.get("match_count").and_then(Value::as_u64).unwrap_or(0);
+    let limit = data.get("limit").and_then(Value::as_u64).unwrap_or(0);
+    if truncated {
+        eprintln!(
+            "⚠ results truncated: returned {}; more matches exist (row limit {}, byte cap {} bytes). \
+             Continue with --offset {} or pass --limit to raise the row cap (maximum 10000).",
+            match_count,
+            limit,
+            data.get("byte_cap").and_then(Value::as_u64).unwrap_or(0),
+            data.get("next_offset").and_then(Value::as_u64).unwrap_or(0),
+        );
+    }
+    if stats && let Some(s) = data.get("stats") {
+        eprintln!(
+            "candidates={}{} matches={} elapsed_us={}",
+            s.get("candidates").and_then(Value::as_u64).unwrap_or(0),
+            if s.get("scanned_all")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            {
+                " (full scan)"
+            } else {
+                ""
+            },
+            s.get("matches").and_then(Value::as_u64).unwrap_or(0),
+            s.get("elapsed_us").and_then(Value::as_u64).unwrap_or(0),
+        );
     }
     Ok(())
 }
@@ -385,7 +599,9 @@ fn run_search(
 // ---------------------------------------------------------------------------
 
 fn daemon_ping(root: &Path) -> bool {
-    try_daemon(root, &Request::Ping).map(|r| r.ok).unwrap_or(false)
+    try_daemon(root, &Request::Ping)
+        .map(|r| r.ok)
+        .unwrap_or(false)
 }
 
 fn daemon_start(path: PathBuf, foreground: bool) -> Result<(), String> {
@@ -393,44 +609,55 @@ fn daemon_start(path: PathBuf, foreground: bool) -> Result<(), String> {
         return daemon::run(&path).map_err(|e| e.to_string());
     }
     if daemon_ping(&path) {
-        println!("daemon already running ({})", daemon::socket_path(&path).display());
+        write_stdout(&format!(
+            "daemon already running ({})\n",
+            daemon::socket_path(&path).display()
+        ))?;
         return Ok(());
     }
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-    let abs = path.canonicalize().map_err(|e| format!("bad path {}: {e}", path.display()))?;
-    std::process::Command::new(exe)
+    let abs = path
+        .canonicalize()
+        .map_err(|e| format!("bad path {}: {e}", path.display()))?;
+    let mut command = std::process::Command::new(exe);
+    command
         .arg("daemon")
         .arg("start")
         .arg(&abs)
         .arg("--foreground")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .map_err(|e| format!("spawn daemon: {e}"))?;
+        .stderr(std::process::Stdio::null());
+    // Detach from the caller's process group so terminal/agent supervisors
+    // do not tear down the daemon when the short-lived start command exits.
+    command.process_group(0);
+    command.spawn().map_err(|e| format!("spawn daemon: {e}"))?;
     // Wait for the socket to come up (index build can take a moment).
     for _ in 0..100 {
         if daemon_ping(&abs) {
-            println!("daemon started ({})", daemon::socket_path(&abs).display());
+            write_stdout(&format!(
+                "daemon started ({})\n",
+                daemon::socket_path(&abs).display()
+            ))?;
             return Ok(());
         }
         std::thread::sleep(Duration::from_millis(100));
     }
-    println!(
-        "daemon spawned; socket not answering yet ({})",
+    write_stdout(&format!(
+        "daemon spawned; socket not answering yet ({})\n",
         daemon::socket_path(&abs).display()
-    );
+    ))?;
     Ok(())
 }
 
 fn daemon_stop(path: PathBuf) -> Result<(), String> {
     match try_daemon(&path, &Request::Shutdown) {
         Some(r) if r.ok => {
-            println!("daemon stopped");
+            write_stdout("daemon stopped\n")?;
             Ok(())
         }
         _ => {
-            println!("no daemon running for {}", path.display());
+            write_stdout(&format!("no daemon running for {}\n", path.display()))?;
             Ok(())
         }
     }
@@ -438,11 +665,41 @@ fn daemon_stop(path: PathBuf) -> Result<(), String> {
 
 fn daemon_status(path: PathBuf) -> Result<(), String> {
     if daemon_ping(&path) {
-        println!("daemon running ({})", daemon::socket_path(&path).display());
+        write_stdout(&format!(
+            "daemon running ({})\n",
+            daemon::socket_path(&path).display()
+        ))?;
     } else {
-        println!("daemon not running for {}", path.display());
+        write_stdout(&format!("daemon not running for {}\n", path.display()))?;
     }
     Ok(())
+}
+
+/// Prepare every local GitPixel prerequisite in one deterministic operation.
+fn ready(path: PathBuf, no_daemon: bool, json: bool) -> Result<(), String> {
+    let root = discover_root(&path)?;
+    let index = execute(&root, Request::Status {}, no_daemon)?;
+    let graph = execute(&root, Request::Graph {}, no_daemon)?;
+    if !no_daemon {
+        daemon_start(root.clone(), false)?;
+    }
+    let status = execute(&root, Request::Status {}, no_daemon)?;
+    let data = serde_json::json!({
+        "root": root,
+        "index": index.get("index").cloned().unwrap_or(Value::Null),
+        "graph": graph,
+        "daemon": if no_daemon { "skipped" } else { "running" },
+        "status": status,
+    });
+    if json {
+        print_data(&data, true)
+    } else {
+        write_stdout(&format!(
+            "ready: {}\nindex: ready\ngraph: ready\ndaemon: {}\n",
+            data.get("root").and_then(Value::as_str).unwrap_or("?"),
+            data.get("daemon").and_then(Value::as_str).unwrap_or("?")
+        ))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -451,7 +708,12 @@ fn daemon_status(path: PathBuf) -> Result<(), String> {
 
 fn run() -> Result<(), String> {
     match Cli::parse().command {
-        Command::Index { path, extractor, max_gram } => {
+        Command::Index {
+            path,
+            extractor,
+            max_gram,
+        } => {
+            let path = discover_root(&path)?;
             let ex = make_extractor(extractor, max_gram);
             let stats = build(&path, ex.as_ref()).map_err(|e| e.to_string())?;
             eprintln!(
@@ -460,186 +722,276 @@ fn run() -> Result<(), String> {
             );
             Ok(())
         }
-        Command::Search { pattern, path, json, stats, no_daemon } => {
-            run_search(pattern, path, json, stats, no_daemon)
-        }
+        Command::Search {
+            pattern,
+            paths,
+            json,
+            stats,
+            limit,
+            offset,
+            no_daemon,
+        } => run_search(pattern, paths, json, stats, limit, offset, no_daemon),
         Command::Symbol { name, path, json } => {
             let data = execute(&path, Request::Symbol { name }, false)?;
             finish_graph_cmd(data, json, |d| {
                 let syms = d.get("symbols")?.as_array()?;
+                let mut output = String::new();
                 if syms.is_empty() {
-                    println!("no symbols found");
+                    output.push_str("no symbols found\n");
                 } else {
                     for s in syms {
-                        println!("{}", symbol_line(s));
+                        output.push_str(&symbol_line(s));
+                        output.push('\n');
                     }
                 }
                 envelope_note(d);
-                Some(())
-            });
+                Some(output)
+            })?;
             Ok(())
         }
-        Command::Context { uid, path, budget, json } => {
-            let data =
-                execute(&path, Request::Context { uid, budget_tokens: budget }, false)?;
+        Command::Context {
+            uid,
+            path,
+            budget,
+            json,
+        } => {
+            let data = execute(
+                &path,
+                Request::Context {
+                    uid,
+                    budget_tokens: budget,
+                },
+                false,
+            )?;
             finish_graph_cmd(data, json, |d| {
+                let mut output = String::new();
                 if let Some(s) = d.get("symbol") {
-                    println!("{}", symbol_line(s));
+                    output.push_str(&symbol_line(s));
+                    output.push('\n');
                 }
                 let text = d.get("text").and_then(Value::as_str).unwrap_or("");
                 if !text.is_empty() {
-                    println!("\n{text}");
+                    output.push('\n');
+                    output.push_str(text);
+                    output.push('\n');
                 } else {
-                    println!(
-                        "\nincoming: {}",
+                    output.push_str(&format!(
+                        "\nincoming: {}\n",
                         serde_json::to_string_pretty(d.get("incoming").unwrap_or(&Value::Null))
                             .unwrap_or_default()
-                    );
-                    println!(
-                        "outgoing: {}",
+                    ));
+                    output.push_str(&format!(
+                        "outgoing: {}\n",
                         serde_json::to_string_pretty(d.get("outgoing").unwrap_or(&Value::Null))
                             .unwrap_or_default()
-                    );
+                    ));
                 }
                 envelope_note(d);
-                Some(())
-            });
+                Some(output)
+            })?;
             Ok(())
         }
-        Command::Impact { uid_or_name, path, direction, depth, json } => {
+        Command::Impact {
+            uid_or_name,
+            path,
+            direction,
+            depth,
+            json,
+        } => {
             let dir = match direction {
                 DirectionArg::Upstream => "upstream",
                 DirectionArg::Downstream => "downstream",
             };
             let data = execute(
                 &path,
-                Request::Impact { uid_or_name, direction: dir.to_string(), depth },
+                Request::Impact {
+                    uid_or_name,
+                    direction: dir.to_string(),
+                    depth,
+                },
                 false,
             )?;
-            finish_graph_cmd(data, json, |_| None);
+            finish_graph_cmd(data, json, |_| None)?;
             Ok(())
         }
-        Command::Uses { uid_or_name, path, role, json } => {
+        Command::Uses {
+            uid_or_name,
+            path,
+            role,
+            offset,
+            json,
+        } => {
             let role_s = match role {
                 RoleArg::Callers => "callers",
                 RoleArg::Callees => "callees",
             };
             let data = execute(
                 &path,
-                Request::Uses { uid_or_name, role: role_s.to_string() },
+                Request::Uses {
+                    uid_or_name,
+                    role: role_s.to_string(),
+                    offset: Some(offset),
+                },
                 false,
             )?;
             finish_graph_cmd(data, json, |d| {
                 let edges = d.get("edges")?.as_array()?;
                 let role = d.get("role").and_then(Value::as_str).unwrap_or("?");
+                let mut output = String::new();
                 if let Some(s) = d.get("symbol") {
-                    println!("{}", symbol_line(s));
+                    output.push_str(&symbol_line(s));
+                    output.push('\n');
                 }
-                println!("{role}: {}", edges.len());
+                output.push_str(&format!(
+                    "{role}: {}/{} (offset {})\n",
+                    edges.len(),
+                    d.get("total_edges").and_then(Value::as_u64).unwrap_or(0),
+                    d.get("offset").and_then(Value::as_u64).unwrap_or(0),
+                ));
                 for e in edges {
                     let tier = e.get("tier").and_then(Value::as_str).unwrap_or("?");
                     let line = e.get("site_line").and_then(Value::as_u64).unwrap_or(0);
                     match e.get("symbol").filter(|s| !s.is_null()) {
-                        Some(s) => println!("  [{tier}] line {line}  {}", symbol_line(s)),
-                        None => println!("  [{tier}] line {line}  <unknown symbol>"),
+                        Some(s) => output
+                            .push_str(&format!("  [{tier}] line {line}  {}\n", symbol_line(s))),
+                        None => {
+                            output.push_str(&format!("  [{tier}] line {line}  <unknown symbol>\n"))
+                        }
                     }
                 }
                 envelope_note(d);
-                Some(())
-            });
+                Some(output)
+            })?;
             Ok(())
         }
-        Command::Trace { from, to, path, json } => {
+        Command::Trace {
+            from,
+            to,
+            path,
+            json,
+        } => {
             let data = execute(&path, Request::Trace { from, to }, false)?;
-            finish_graph_cmd(data, json, |_| None);
+            finish_graph_cmd(data, json, |_| None)?;
             Ok(())
         }
-        Command::Processes { path, json } => {
-            let data = execute(&path, Request::Processes {}, false)?;
-            finish_graph_cmd(data, json, |_| None);
+        Command::Processes { path, offset, json } => {
+            let data = execute(
+                &path,
+                Request::Processes {
+                    offset: Some(offset),
+                },
+                false,
+            )?;
+            finish_graph_cmd(data, json, |_| None)?;
             Ok(())
         }
-        Command::Clusters { path, json } => {
-            let data = execute(&path, Request::Clusters {}, false)?;
-            finish_graph_cmd(data, json, |_| None);
+        Command::Clusters { path, offset, json } => {
+            let data = execute(
+                &path,
+                Request::Clusters {
+                    offset: Some(offset),
+                },
+                false,
+            )?;
+            finish_graph_cmd(data, json, |_| None)?;
             Ok(())
         }
-        Command::Changes { path, base, json } => {
-            let data = execute(&path, Request::Changes { base }, false)?;
-            finish_graph_cmd(data, json, |_| None);
+        Command::Changes {
+            path,
+            base,
+            offset,
+            json,
+        } => {
+            let data = execute(
+                &path,
+                Request::Changes {
+                    base,
+                    offset: Some(offset),
+                },
+                false,
+            )?;
+            finish_graph_cmd(data, json, |_| None)?;
             Ok(())
         }
         Command::Graph { path, json } => {
-            let root = path
-                .canonicalize()
-                .map_err(|e| format!("bad path {}: {e}", path.display()))?;
-            let db = root.join(gitpixel_core::index::SHARD_DIR).join("graph.db");
-            let _ = std::fs::remove_file(&db);
-            let started = std::time::Instant::now();
-            let stats = gitpixel_graph::build::build_graph(&root, &db)
-                .map_err(|e| e.to_string())?;
-            let v = serde_json::json!({
-                "files": stats.files,
-                "symbols": stats.symbols,
-                "edges": stats.edges,
-                "unresolved": stats.unresolved,
-                "elapsed_ms": stats.elapsed_ms as u64,
-            });
-            eprintln!("graph built in {} ms -> {}", started.elapsed().as_millis(), db.display());
-            print_data(&v, json);
+            let v = execute(&path, Request::Graph {}, false)?;
+            eprintln!(
+                "graph built in {} ms -> {}",
+                v.get("elapsed_ms").and_then(Value::as_u64).unwrap_or(0),
+                path.join(gitpixel_core::index::SHARD_DIR)
+                    .join("graph.db")
+                    .display()
+            );
+            print_data(&v, json)?;
             Ok(())
         }
         Command::Status { path, json } => {
             let data = execute(&path, Request::Status {}, false)?;
             if json {
-                print_data(&data, true);
+                print_data(&data, true)?;
             } else {
-                println!("root: {}", data.get("root").and_then(Value::as_str).unwrap_or("?"));
+                let mut output = format!(
+                    "root: {}\n",
+                    data.get("root").and_then(Value::as_str).unwrap_or("?")
+                );
                 if let Some(i) = data.get("index") {
-                    println!(
-                        "index: commit={} base_files={} delta_files={} overlay_files={} tombstones={}",
+                    output.push_str(&format!(
+                        "index: commit={} base_files={} delta_files={} overlay_files={} tombstones={}\n",
                         i.get("commit_oid").and_then(Value::as_str).unwrap_or("-"),
                         i.get("base_files").and_then(Value::as_u64).unwrap_or(0),
                         i.get("delta_files").and_then(Value::as_u64).unwrap_or(0),
                         i.get("overlay_files").and_then(Value::as_u64).unwrap_or(0),
                         i.get("tombstones").and_then(Value::as_u64).unwrap_or(0),
-                    );
+                    ));
                 }
                 match data.get("graph") {
                     Some(g) if g.get("present").and_then(Value::as_bool).unwrap_or(false) => {
-                        println!(
-                            "graph: files={} symbols={} edges={} unresolved_calls={}",
+                        output.push_str(&format!(
+                            "graph: files={} symbols={} edges={} unresolved_calls={}\n",
                             g.get("files").and_then(Value::as_u64).unwrap_or(0),
                             g.get("symbols").and_then(Value::as_u64).unwrap_or(0),
                             g.get("edges").and_then(Value::as_u64).unwrap_or(0),
-                            g.get("unresolved_calls").and_then(Value::as_u64).unwrap_or(0),
-                        );
+                            g.get("unresolved_calls")
+                                .and_then(Value::as_u64)
+                                .unwrap_or(0),
+                        ));
                     }
-                    _ => println!("graph: not built (runs on first graph command)"),
+                    _ => output.push_str("graph: not built (runs on first graph command)\n"),
                 }
-                println!(
-                    "daemon: {}",
-                    if daemon_ping(&path) { "running" } else { "not running" }
-                );
+                output.push_str(&format!(
+                    "daemon: {}\n",
+                    if daemon_ping(&path) {
+                        "running"
+                    } else {
+                        "not running"
+                    }
+                ));
+                write_stdout(&output)?;
             }
             Ok(())
         }
+        Command::Ready {
+            path,
+            no_daemon,
+            json,
+        } => ready(path, no_daemon, json),
         Command::Stats { path } => {
+            let path = discover_root(&path)?;
             let shard = Shard::open(&shard_path(&path)).map_err(|e| e.to_string())?;
             let _ = extractor_for_shard(&shard); // validates extractor id
-            println!(
-                "files={} grams={} extractor={} commit={}",
+            write_stdout(&format!(
+                "files={} grams={} extractor={} commit={}\n",
                 shard.file_count(),
                 shard.gram_count(),
                 shard.extractor_id(),
                 shard.commit_oid().unwrap_or("-")
-            );
+            ))?;
             Ok(())
         }
         Command::Daemon { cmd } => match cmd {
-            DaemonCmd::Start { path, foreground } => daemon_start(path, foreground),
-            DaemonCmd::Stop { path } => daemon_stop(path),
-            DaemonCmd::Status { path } => daemon_status(path),
+            DaemonCmd::Start { path, foreground } => daemon_start(discover_root(&path)?, foreground),
+            DaemonCmd::Stop { path } => daemon_stop(discover_root(&path)?),
+            DaemonCmd::Status { path } => daemon_status(discover_root(&path)?),
         },
     }
 }

@@ -57,10 +57,7 @@ fn parse_diff(output: &str) -> Vec<FileDiff> {
         } else if let Some(rest) = line.strip_prefix("+++ ") {
             let new = rest.trim();
             let (path, status) = if new == "/dev/null" {
-                (
-                    old_path.clone().unwrap_or_default(),
-                    FileStatus::Deleted,
-                )
+                (old_path.clone().unwrap_or_default(), FileStatus::Deleted)
             } else {
                 let p = new.trim_start_matches("b/").to_string();
                 let status = if old_path.as_deref() == Some("/dev/null") {
@@ -70,24 +67,28 @@ fn parse_diff(output: &str) -> Vec<FileDiff> {
                 };
                 (p, status)
             };
-            files.push(FileDiff { path, status, new_ranges: Vec::new() });
+            files.push(FileDiff {
+                path,
+                status,
+                new_ranges: Vec::new(),
+            });
         } else if line.starts_with("@@") {
             // @@ -a[,b] +c[,d] @@
-            if let Some(cur) = files.last_mut() {
-                if let Some(plus) = line.split(' ').find(|t| t.starts_with('+')) {
-                    let spec = &plus[1..];
-                    let mut it = spec.splitn(2, ',');
-                    let start: u32 = it.next().and_then(|s| s.parse().ok()).unwrap_or(0);
-                    let len: u32 = it.next().and_then(|s| s.parse().ok()).unwrap_or(1);
-                    if start > 0 {
-                        let end = start + len.saturating_sub(1).max(0);
-                        cur.new_ranges.push((start, end.max(start)));
-                    } else if len == 0 {
-                        // pure deletion: mark the position after which lines
-                        // were removed so adjacent symbols are caught.
-                        let anchor = start.max(1);
-                        cur.new_ranges.push((anchor, anchor));
-                    }
+            if let Some(cur) = files.last_mut()
+                && let Some(plus) = line.split(' ').find(|t| t.starts_with('+'))
+            {
+                let spec = &plus[1..];
+                let mut it = spec.splitn(2, ',');
+                let start: u32 = it.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+                let len: u32 = it.next().and_then(|s| s.parse().ok()).unwrap_or(1);
+                if start > 0 {
+                    let end = start + len.saturating_sub(1);
+                    cur.new_ranges.push((start, end.max(start)));
+                } else if len == 0 {
+                    // pure deletion: mark the position after which lines
+                    // were removed so adjacent symbols are caught.
+                    let anchor = start.max(1);
+                    cur.new_ranges.push((anchor, anchor));
                 }
             }
         }
@@ -99,6 +100,20 @@ fn overlaps(ranges: &[(u32, u32)], start: u32, end: u32) -> bool {
     ranges.iter().any(|&(a, b)| a <= end && start <= b)
 }
 
+/// Validate a user-supplied git ref for `changes --base`. A ref may be a
+/// commit oid, branch/tag name, or a rev expression (`HEAD~1`, `main@{1}`),
+/// but it must never be parsed by git as an option: anything starting with
+/// `-` is rejected to block option injection (e.g. `--output=/etc/passwd`).
+fn validate_base_ref(r: &str) -> Result<&str, BoxError> {
+    if r.starts_with('-') {
+        return Err(format!("invalid base ref {r:?}: must not start with '-'").into());
+    }
+    if r.is_empty() {
+        return Err("invalid base ref: empty".into());
+    }
+    Ok(r)
+}
+
 pub fn detect(
     store: &GraphStore,
     root: &Path,
@@ -108,7 +123,11 @@ pub fn detect(
     let mut cmd = Command::new("git");
     cmd.arg("-C").arg(root).arg("diff").arg("--unified=0");
     if let Some(r) = base_ref {
-        cmd.arg(r);
+        let r = validate_base_ref(r)?;
+        // `--end-of-options` (git >= 2.36) makes git treat the next token
+        // strictly as a rev/path, never an option — defense in depth on top
+        // of the leading-dash rejection above.
+        cmd.arg("--end-of-options").arg(r);
     }
     cmd.arg("--").arg(".");
     let out = cmd.output()?;
@@ -212,4 +231,22 @@ pub fn detect(
         risk,
         envelope_note,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validate_base_ref_rejects_leading_dash() {
+        // Option injection: a base ref starting with '-' must be rejected.
+        assert!(validate_base_ref("--output=/etc/passwd").is_err());
+        assert!(validate_base_ref("-x").is_err());
+        assert!(validate_base_ref("").is_err());
+        // Valid refs pass.
+        assert!(validate_base_ref("HEAD").is_ok());
+        assert!(validate_base_ref("HEAD~1").is_ok());
+        assert!(validate_base_ref("main").is_ok());
+        assert!(validate_base_ref("abcdef1234567890").is_ok());
+    }
 }

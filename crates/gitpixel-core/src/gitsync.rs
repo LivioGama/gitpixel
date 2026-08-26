@@ -42,11 +42,29 @@ pub fn ls_files(root: &Path) -> Vec<String> {
         .collect()
 }
 
+/// Blob content of `path` as it exists in commit `oid` (`git show oid:path`).
+/// Returns the raw bytes git stores for that path at that commit — for a
+/// symlink this is the target text (a few bytes), never a traversal. `None`
+/// on any git failure or missing path at that commit.
+pub fn show_blob(root: &Path, oid: &str, rel: &str) -> Option<Vec<u8>> {
+    let spec = format!("{oid}:{rel}");
+    git_out(root, &["show", "--end-of-options", &spec])
+}
+
+/// Size of a committed blob without materializing it.
+pub fn blob_size(root: &Path, oid: &str, rel: &str) -> Option<u64> {
+    let spec = format!("{oid}:{rel}");
+    let out = git_out(root, &["cat-file", "-s", &spec])?;
+    String::from_utf8(out).ok()?.trim().parse().ok()
+}
+
 /// `git diff --name-status --no-renames -z <from> <to>` as (status, path).
 /// Statuses are single chars: A, M, D, T (typechange), etc.
 pub fn diff_name_status(root: &Path, from: &str, to: &str) -> Vec<(char, String)> {
-    let Some(out) = git_out(root, &["diff", "--name-status", "--no-renames", "-z", from, to])
-    else {
+    let Some(out) = git_out(
+        root,
+        &["diff", "--name-status", "--no-renames", "-z", from, to],
+    ) else {
         return Vec::new();
     };
     let mut fields = out.split(|&b| b == 0).filter(|s| !s.is_empty());

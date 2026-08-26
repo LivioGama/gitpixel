@@ -31,7 +31,9 @@ impl FromStr for Direction {
         match s.to_ascii_lowercase().as_str() {
             "upstream" | "up" | "callers" => Ok(Direction::Upstream),
             "downstream" | "down" | "callees" => Ok(Direction::Downstream),
-            other => Err(format!("unknown direction: {other} (expected upstream|downstream)")),
+            other => Err(format!(
+                "unknown direction: {other} (expected upstream|downstream)"
+            )),
         }
     }
 }
@@ -93,9 +95,11 @@ pub(crate) fn file_path_by_id(store: &GraphStore, file_id: i64) -> Result<String
     use rusqlite::OptionalExtension;
     Ok(store
         .conn()
-        .query_row("SELECT path FROM files WHERE id = ?1", params![file_id], |r| {
-            r.get::<_, String>(0)
-        })
+        .query_row(
+            "SELECT path FROM files WHERE id = ?1",
+            params![file_id],
+            |r| r.get::<_, String>(0),
+        )
         .optional()?
         .unwrap_or_default())
 }
@@ -138,9 +142,9 @@ pub fn impact(
     max_depth: u32,
     limit_per_depth: usize,
 ) -> Result<ImpactReport, StoreError> {
-    let target = store.symbol_by_uid(uid)?.ok_or_else(|| {
-        StoreError::Sql(rusqlite::Error::QueryReturnedNoRows)
-    })?;
+    let target = store
+        .symbol_by_uid(uid)?
+        .ok_or_else(|| StoreError::Sql(rusqlite::Error::QueryReturnedNoRows))?;
     let max_depth = max_depth.clamp(1, 3);
 
     let mut visited: HashSet<i64> = HashSet::new();
@@ -219,7 +223,10 @@ pub fn impact(
         nproc,
         risk,
         if envelope.lower_bound {
-            format!(" (lower bound: {} unresolved same-name call sites)", envelope.unresolved_same_name)
+            format!(
+                " (lower bound: {} unresolved same-name call sites)",
+                envelope.unresolved_same_name
+            )
         } else {
             String::new()
         }
@@ -245,7 +252,7 @@ pub fn impact(
 /// snake_case identifiers into lowercase words.
 pub(crate) fn split_ident_words(name: &str) -> Vec<String> {
     let mut words = Vec::new();
-    for chunk in name.split(|c: char| c == '_' || c == '-' || c == '.' || c == ':' || c == '#') {
+    for chunk in name.split(['_', '-', '.', ':', '#']) {
         if chunk.is_empty() {
             continue;
         }
@@ -309,6 +316,7 @@ mod tests {
                 kind: EdgeKind::Calls,
                 tier: Tier::Exact,
                 site_line: 1,
+                receiver: None,
             })
             .unwrap();
     }
@@ -324,9 +332,18 @@ mod tests {
         call(&store, b, a);
         call(&store, c, b);
         // unresolved same-name call site for "alpha" → lower bound
-        store.insert_unresolved_call(fid, "alpha", None, 42).unwrap();
+        store
+            .insert_unresolved_call(fid, "alpha", None, 42, None)
+            .unwrap();
 
-        let report = impact(&store, "src/a.ts#alpha#function", Direction::Upstream, 3, 100).unwrap();
+        let report = impact(
+            &store,
+            "src/a.ts#alpha#function",
+            Direction::Upstream,
+            3,
+            100,
+        )
+        .unwrap();
         assert_eq!(report.counts_by_depth, [1, 1, 0]);
         assert_eq!(report.d1_will_break.len(), 1);
         assert_eq!(report.d1_will_break[0].name, "beta");

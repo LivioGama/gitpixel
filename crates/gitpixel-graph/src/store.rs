@@ -6,7 +6,7 @@
 
 use std::path::Path;
 
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug)]
@@ -124,7 +124,11 @@ impl Tier {
         }
     }
     pub fn parse(s: &str) -> Self {
-        if s == "probable" { Tier::Probable } else { Tier::Exact }
+        if s == "probable" {
+            Tier::Probable
+        } else {
+            Tier::Exact
+        }
     }
 }
 
@@ -166,6 +170,10 @@ pub struct EdgeRow {
     pub kind: EdgeKind,
     pub tier: Tier,
     pub site_line: u32,
+    /// Receiver expression at the call site (e.g. `x` in `x.parse()`), if any.
+    /// Preserved across incremental demote/re-resolve so receiver calls are
+    /// never falsely promoted from Probable to Exact.
+    pub receiver: Option<String>,
 }
 
 pub struct GraphStore {
@@ -174,19 +182,35 @@ pub struct GraphStore {
 
 impl GraphStore {
     pub fn open(path: &Path) -> Result<Self> {
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        let conn = Connection::open(path)?;
+        // NOFOLLOW rejects a path with ANY symlinked component (newer SQLite),
+        // which breaks legitimate symlinked prefixes like macOS's /var ->
+        // /private/var in $TMPDIR. Canonicalize the parent directory so only
+        // the db file itself keeps the no-symlink protection.
+        let path = match (path.parent(), path.file_name()) {
+            (Some(parent), Some(name)) if !parent.as_os_str().is_empty() => {
+                let _ = std::fs::create_dir_all(parent);
+                parent
+                    .canonicalize()
+                    .map(|p| p.join(name))
+                    .unwrap_or_else(|_| path.to_path_buf())
+            }
+            _ => path.to_path_buf(),
+        };
+        let conn = Connection::open_with_flags(
+            &path,
+            OpenFlags::default() | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+        )?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.execute_batch(SCHEMA)?;
+        migrate(&conn)?;
         Ok(Self { conn })
     }
 
     pub fn open_in_memory() -> Result<Self> {
         let conn = Connection::open_in_memory()?;
         conn.execute_batch(SCHEMA)?;
+        migrate(&conn)?;
         Ok(Self { conn })
     }
 
@@ -207,7 +231,9 @@ impl GraphStore {
     pub fn replace_file(&mut self, path: &str, blob_oid: &str, lang: &str) -> Result<i64> {
         let tx = self.conn.transaction()?;
         let existing: Option<i64> = tx
-            .query_row("SELECT id FROM files WHERE path = ?1", params![path], |r| r.get(0))
+            .query_row("SELECT id FROM files WHERE path = ?1", params![path], |r| {
+                r.get(0)
+            })
             .optional()?;
         let id = if let Some(id) = existing {
             tx.execute(
@@ -220,7 +246,10 @@ impl GraphStore {
             )?;
             tx.execute("DELETE FROM symbols WHERE file_id = ?1", params![id])?;
             tx.execute("DELETE FROM imports WHERE file_id = ?1", params![id])?;
-            tx.execute("DELETE FROM unresolved_calls WHERE file_id = ?1", params![id])?;
+            tx.execute(
+                "DELETE FROM unresolved_calls WHERE file_id = ?1",
+                params![id],
+            )?;
             tx.execute(
                 "UPDATE files SET blob_oid = ?2, lang = ?3 WHERE id = ?1",
                 params![id, blob_oid, lang],
@@ -252,13 +281,17 @@ impl GraphStore {
             )?;
             tx.execute("DELETE FROM symbols WHERE file_id = ?1", params![id])?;
             tx.execute("DELETE FROM imports WHERE file_id = ?1", params![id])?;
-            tx.execute("DELETE FROM unresolved_calls WHERE file_id = ?1", params![id])?;
+            tx.execute(
+                "DELETE FROM unresolved_calls WHERE file_id = ?1",
+                params![id],
+            )?;
             tx.execute("DELETE FROM files WHERE id = ?1", params![id])?;
         }
         tx.commit()?;
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn insert_symbol(
         &self,
         file_id: i64,
@@ -274,7 +307,16 @@ impl GraphStore {
             "INSERT OR REPLACE INTO symbols
                (uid, file_id, name, qualified, kind, start_line, end_line, sig)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            params![uid, file_id, name, qualified, kind.as_str(), start_line, end_line, sig],
+            params![
+                uid,
+                file_id,
+                name,
+                qualified,
+                kind.as_str(),
+                start_line,
+                end_line,
+                sig
+            ],
         )?;
         Ok(self.conn.last_insert_rowid())
     }
@@ -284,19 +326,28 @@ impl GraphStore {
         file_id: i64,
         spec: &str,
         resolved_file_id: Option<i64>,
+        bindings: &[String],
     ) -> Result<()> {
+        let bindings_csv = bindings.join(",");
         self.conn.execute(
-            "INSERT INTO imports (file_id, spec, resolved_file_id) VALUES (?1, ?2, ?3)",
-            params![file_id, spec, resolved_file_id],
+            "INSERT INTO imports (file_id, spec, resolved_file_id, bindings) VALUES (?1, ?2, ?3, ?4)",
+            params![file_id, spec, resolved_file_id, bindings_csv],
         )?;
         Ok(())
     }
 
     pub fn insert_edge(&self, e: &EdgeRow) -> Result<()> {
         self.conn.execute(
-            "INSERT INTO edges (src_id, dst_id, kind, tier, site_line)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![e.src_id, e.dst_id, e.kind.as_str(), e.tier.as_str(), e.site_line],
+            "INSERT INTO edges (src_id, dst_id, kind, tier, site_line, receiver)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                e.src_id,
+                e.dst_id,
+                e.kind.as_str(),
+                e.tier.as_str(),
+                e.site_line,
+                e.receiver
+            ],
         )?;
         Ok(())
     }
@@ -307,11 +358,12 @@ impl GraphStore {
         name: &str,
         enclosing_symbol_id: Option<i64>,
         site_line: u32,
+        receiver: Option<&str>,
     ) -> Result<()> {
         self.conn.execute(
-            "INSERT INTO unresolved_calls (file_id, name, enclosing_symbol_id, site_line)
-             VALUES (?1, ?2, ?3, ?4)",
-            params![file_id, name, enclosing_symbol_id, site_line],
+            "INSERT INTO unresolved_calls (file_id, name, enclosing_symbol_id, site_line, receiver)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![file_id, name, enclosing_symbol_id, site_line, receiver],
         )?;
         Ok(())
     }
@@ -337,9 +389,16 @@ impl GraphStore {
     }
 
     pub fn files(&self) -> Result<Vec<FileRow>> {
-        let mut stmt = self.conn.prepare("SELECT id, path, blob_oid, lang FROM files")?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, path, blob_oid, lang FROM files")?;
         let rows = stmt.query_map([], |r| {
-            Ok(FileRow { id: r.get(0)?, path: r.get(1)?, blob_oid: r.get(2)?, lang: r.get(3)? })
+            Ok(FileRow {
+                id: r.get(0)?,
+                path: r.get(1)?,
+                blob_oid: r.get(2)?,
+                lang: r.get(3)?,
+            })
         })?;
         Ok(rows.collect::<std::result::Result<_, _>>()?)
     }
@@ -365,7 +424,7 @@ impl GraphStore {
         let sql = format!("SELECT {} FROM symbols WHERE uid = ?1", Self::SYMBOL_COLS);
         Ok(self
             .conn
-            .query_row(&sql, params![uid], |r| Self::row_to_symbol(r))
+            .query_row(&sql, params![uid], Self::row_to_symbol)
             .optional()?)
     }
 
@@ -375,7 +434,7 @@ impl GraphStore {
             Self::SYMBOL_COLS
         );
         let mut stmt = self.conn.prepare(&sql)?;
-        let rows = stmt.query_map(params![name, limit], |r| Self::row_to_symbol(r))?;
+        let rows = stmt.query_map(params![name, limit], Self::row_to_symbol)?;
         Ok(rows.collect::<std::result::Result<_, _>>()?)
     }
 
@@ -385,7 +444,7 @@ impl GraphStore {
             Self::SYMBOL_COLS
         );
         let mut stmt = self.conn.prepare(&sql)?;
-        let rows = stmt.query_map(params![file_id], |r| Self::row_to_symbol(r))?;
+        let rows = stmt.query_map(params![file_id], Self::row_to_symbol)?;
         Ok(rows.collect::<std::result::Result<_, _>>()?)
     }
 
@@ -403,12 +462,14 @@ impl GraphStore {
         let col = if outgoing { "src_id" } else { "dst_id" };
         let sql = match kind {
             Some(_) => format!(
-                "SELECT src_id, dst_id, kind, tier, site_line FROM edges
+                "SELECT src_id, dst_id, kind, tier, site_line, receiver FROM edges
                  WHERE {col} = ?1 AND kind = ?2"
             ),
-            None => format!(
-                "SELECT src_id, dst_id, kind, tier, site_line FROM edges WHERE {col} = ?1"
-            ),
+            None => {
+                format!(
+                    "SELECT src_id, dst_id, kind, tier, site_line, receiver FROM edges WHERE {col} = ?1"
+                )
+            }
         };
         let map = |r: &rusqlite::Row<'_>| -> rusqlite::Result<EdgeRow> {
             Ok(EdgeRow {
@@ -417,6 +478,7 @@ impl GraphStore {
                 kind: EdgeKind::parse(&r.get::<_, String>(2)?),
                 tier: Tier::parse(&r.get::<_, String>(3)?),
                 site_line: r.get(4)?,
+                receiver: r.get(5)?,
             })
         };
         let mut out = Vec::new();
@@ -446,17 +508,46 @@ impl GraphStore {
             params![name],
             |r| r.get(0),
         )?;
-        Ok(Envelope { lower_bound: unresolved > 0, unresolved_same_name: unresolved })
+        Ok(Envelope {
+            lower_bound: unresolved > 0,
+            unresolved_same_name: unresolved,
+        })
     }
 
     pub fn counts(&self) -> Result<(u64, u64, u64, u64)> {
-        let files: u64 = self.conn.query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0))?;
-        let symbols: u64 =
-            self.conn.query_row("SELECT COUNT(*) FROM symbols", [], |r| r.get(0))?;
-        let edges: u64 = self.conn.query_row("SELECT COUNT(*) FROM edges", [], |r| r.get(0))?;
+        let files: u64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0))?;
+        let symbols: u64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM symbols", [], |r| r.get(0))?;
+        let edges: u64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM edges", [], |r| r.get(0))?;
         let unresolved: u64 =
-            self.conn.query_row("SELECT COUNT(*) FROM unresolved_calls", [], |r| r.get(0))?;
+            self.conn
+                .query_row("SELECT COUNT(*) FROM unresolved_calls", [], |r| r.get(0))?;
         Ok((files, symbols, edges, unresolved))
+    }
+
+    /// Read a `meta` table value, or `None` if the key is absent.
+    pub fn meta_get(&self, key: &str) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row("SELECT value FROM meta WHERE key = ?1", params![key], |r| {
+                r.get::<_, String>(0)
+            })
+            .optional()?)
+    }
+
+    /// Upsert a `meta` table value.
+    pub fn meta_set(&self, key: &str, value: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO meta (key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![key, value],
+        )?;
+        Ok(())
     }
 }
 
@@ -484,7 +575,8 @@ CREATE TABLE IF NOT EXISTS imports (
   id INTEGER PRIMARY KEY,
   file_id INTEGER NOT NULL,
   spec TEXT NOT NULL,
-  resolved_file_id INTEGER
+  resolved_file_id INTEGER,
+  bindings TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_imports_file ON imports(file_id);
 CREATE INDEX IF NOT EXISTS idx_imports_resolved ON imports(resolved_file_id);
@@ -494,7 +586,8 @@ CREATE TABLE IF NOT EXISTS edges (
   dst_id INTEGER NOT NULL,
   kind TEXT NOT NULL,
   tier TEXT NOT NULL,
-  site_line INTEGER NOT NULL DEFAULT 0
+  site_line INTEGER NOT NULL DEFAULT 0,
+  receiver TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_edges_src ON edges(src_id);
 CREATE INDEX IF NOT EXISTS idx_edges_dst ON edges(dst_id);
@@ -503,7 +596,8 @@ CREATE TABLE IF NOT EXISTS unresolved_calls (
   file_id INTEGER NOT NULL,
   name TEXT NOT NULL,
   enclosing_symbol_id INTEGER,
-  site_line INTEGER NOT NULL DEFAULT 0
+  site_line INTEGER NOT NULL DEFAULT 0,
+  receiver TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_unresolved_name ON unresolved_calls(name);
 CREATE TABLE IF NOT EXISTS processes (
@@ -535,3 +629,72 @@ CREATE TABLE IF NOT EXISTS meta (
   value TEXT NOT NULL
 );
 ";
+
+/// Idempotent schema migrations for graphs created before a column existed.
+/// `CREATE TABLE IF NOT EXISTS` won't add columns to an existing table, so
+/// additive columns are patched here. Each step introspects `table_info` and
+/// only alters when the column is missing.
+fn migrate(conn: &Connection) -> Result<()> {
+    let has_column = |table: &str, col: &str| -> Result<bool> {
+        let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(1))?;
+        for row in rows {
+            if row? == col {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    };
+    if !has_column("unresolved_calls", "receiver")? {
+        conn.execute("ALTER TABLE unresolved_calls ADD COLUMN receiver TEXT", [])?;
+    }
+    if !has_column("edges", "receiver")? {
+        conn.execute("ALTER TABLE edges ADD COLUMN receiver TEXT", [])?;
+    }
+    if !has_column("imports", "bindings")? {
+        conn.execute(
+            "ALTER TABLE imports ADD COLUMN bindings TEXT NOT NULL DEFAULT ''",
+            [],
+        )?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::symlink;
+
+    #[test]
+    fn open_rejects_database_symlink_without_modifying_target() {
+        let dir = std::env::temp_dir().join(format!("gpx-store-link-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        let external = dir.join("external.db");
+        let conn = Connection::open(&external).unwrap();
+        conn.execute("CREATE TABLE sentinel (id INTEGER)", []).unwrap();
+        drop(conn);
+        let graph = dir.join("graph.db");
+        symlink(&external, &graph).unwrap();
+
+        assert!(GraphStore::open(&graph).is_err());
+        let conn = Connection::open(&external).unwrap();
+        let graph_tables: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name IN ('files', 'symbols', 'edges')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(graph_tables, 0);
+        let sentinel: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name = 'sentinel'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(sentinel, 1);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}

@@ -85,8 +85,16 @@ fn resolve_js(spec: &str, importer_rel: &str, all_files: &[String]) -> Option<St
 fn resolve_rust(spec: &str, importer_rel: &str, all_files: &[String]) -> Option<String> {
     // Strip alias / braces: `crate::a::b as c`, `crate::a::{b, c}`.
     let spec = spec.split(" as ").next().unwrap_or(spec);
-    let spec = spec.split('{').next().unwrap_or(spec).trim_end_matches("::").trim();
-    let segs: Vec<&str> = spec.split("::").filter(|s| !s.is_empty() && *s != "*").collect();
+    let spec = spec
+        .split('{')
+        .next()
+        .unwrap_or(spec)
+        .trim_end_matches("::")
+        .trim();
+    let segs: Vec<&str> = spec
+        .split("::")
+        .filter(|s| !s.is_empty() && *s != "*")
+        .collect();
     if segs.is_empty() {
         return None;
     }

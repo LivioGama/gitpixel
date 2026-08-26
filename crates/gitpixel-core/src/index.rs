@@ -4,6 +4,9 @@
 //! in Phase 2; the search path here is already the final shape — plan →
 //! resolve postings → verify.
 
+use std::fs::File;
+use std::io::{self, Read};
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 use rayon::prelude::*;
@@ -16,6 +19,45 @@ use crate::verify::{MatchLine, Verifier, VerifyError};
 
 pub const SHARD_DIR: &str = ".gitpixel";
 pub const SHARD_FILE: &str = "base.shard";
+pub const MAX_FILE_BYTES: u64 = 4 * 1024 * 1024;
+
+pub fn open_regular_bounded(path: &Path, max_bytes: u64) -> io::Result<File> {
+    let before = std::fs::symlink_metadata(path)?;
+    if !before.file_type().is_file() || before.len() > max_bytes {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "path is not a bounded regular file",
+        ));
+    }
+    let file = File::open(path)?;
+    let opened = file.metadata()?;
+    let after = std::fs::symlink_metadata(path)?;
+    if !after.file_type().is_file()
+        || opened.dev() != after.dev()
+        || opened.ino() != after.ino()
+        || opened.len() > max_bytes
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "path changed while opening",
+        ));
+    }
+    Ok(file)
+}
+
+pub fn read_regular_bounded(path: &Path, max_bytes: u64) -> io::Result<Vec<u8>> {
+    let file = open_regular_bounded(path, max_bytes)?;
+    let mut bytes = Vec::with_capacity(file.metadata()?.len() as usize);
+    file.take(max_bytes.saturating_add(1))
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > max_bytes {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "file grew beyond size limit while reading",
+        ));
+    }
+    Ok(bytes)
+}
 
 #[derive(Debug)]
 pub enum IndexError {
@@ -96,7 +138,7 @@ pub fn build(root: &Path, extractor: &dyn GramExtractor) -> Result<BuildStats, I
     let extracted: Vec<FileGrams> = paths
         .par_iter()
         .filter_map(|path| {
-            let content = std::fs::read(path).ok()?;
+            let content = read_regular_bounded(path, MAX_FILE_BYTES).ok()?;
             // Binary sniff: NUL in the first 8KiB.
             if content[..content.len().min(8192)].contains(&0) {
                 return None;
@@ -111,7 +153,11 @@ pub fn build(root: &Path, extractor: &dyn GramExtractor) -> Result<BuildStats, I
             let mut hashes: Vec<u64> = hits.iter().map(|h| h.hash).collect();
             hashes.sort_unstable();
             hashes.dedup();
-            Some(FileGrams { rel, bytes: content.len() as u64, hashes })
+            Some(FileGrams {
+                rel,
+                bytes: content.len() as u64,
+                hashes,
+            })
         })
         .collect();
 
@@ -141,6 +187,10 @@ pub struct SearchStats {
     pub scanned_all: bool,
     pub matches: usize,
     pub elapsed_us: u128,
+    /// True when the returned matches were capped by a row limit (more matches
+    /// exist beyond the returned slice). Always `false` for the legacy
+    /// unlimited search path.
+    pub truncated: bool,
 }
 
 /// Plan → resolve → verify against an open shard.
@@ -151,8 +201,7 @@ pub fn search(
     pattern: &str,
 ) -> Result<(Vec<MatchLine>, SearchStats), IndexError> {
     let started = std::time::Instant::now();
-    let query = plan_pattern(pattern, extractor)
-        .map_err(|e| IndexError::Pattern(e.to_string()))?;
+    let query = plan_pattern(pattern, extractor).map_err(|e| IndexError::Pattern(e.to_string()))?;
     let scanned_all = matches!(query, crate::posting::GramQuery::All);
     let candidates = resolve_query(&query, shard.file_count(), &|h| shard.postings(h));
 
@@ -163,7 +212,7 @@ pub fn search(
             let rel = shard.path_of(id)?;
             let abs = root.join(rel);
             let mut out = Vec::new();
-            verifier.search_file(&abs, rel, &mut out).ok()?;
+            verifier.search_file(&abs, rel, &mut out, None).ok()?;
             (!out.is_empty()).then_some(out)
         })
         .collect();
@@ -175,6 +224,7 @@ pub fn search(
         scanned_all,
         matches: matches.len(),
         elapsed_us: started.elapsed().as_micros(),
+        truncated: false,
     };
     Ok((matches, stats))
 }

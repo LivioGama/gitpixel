@@ -25,7 +25,11 @@ pub struct TraceResult {
     pub furthest_reachable: Option<TraceHop>,
 }
 
-fn hop(store: &GraphStore, id: i64, edge_kind: Option<String>) -> Result<Option<TraceHop>, StoreError> {
+fn hop(
+    store: &GraphStore,
+    id: i64,
+    edge_kind: Option<String>,
+) -> Result<Option<TraceHop>, StoreError> {
     Ok(match symbol_by_id(store, id)? {
         Some(s) => Some(TraceHop {
             path: file_path_by_id(store, s.file_id)?,
@@ -107,9 +111,17 @@ pub fn trace(
                 hops.push(h);
             }
         }
-        Ok(TraceResult { found: true, hops, furthest_reachable: None })
+        Ok(TraceResult {
+            found: true,
+            hops,
+            furthest_reachable: None,
+        })
     } else {
         let furthest = hop(store, deepest.0, None)?;
-        Ok(TraceResult { found: false, hops: Vec::new(), furthest_reachable: furthest })
+        Ok(TraceResult {
+            found: false,
+            hops: Vec::new(),
+            furthest_reachable: furthest,
+        })
     }
 }

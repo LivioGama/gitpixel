@@ -3,7 +3,7 @@
 //! fast); an accept thread and a notify watcher feed one mpsc channel.
 
 use std::collections::BTreeMap;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufReader, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Component, Path, PathBuf};
@@ -17,6 +17,16 @@ use crate::api::{Request, Response, ServeError, Service};
 const IDLE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const DEBOUNCE: Duration = Duration::from_millis(500);
 const IGNORED_DIRS: &[&str] = [".gitpixel", ".git", "target", "node_modules"].as_slice();
+/// Maximum length of a single NDJSON request line. A request larger than this
+/// is rejected to prevent a malicious client from exhausting memory with a
+/// multi-GB line. The largest legitimate request (a search pattern) is well
+/// under 1 KiB.
+const MAX_REQUEST_LINE: usize = 64 * 1024;
+const CONNECTION_DEADLINE: Duration = Duration::from_secs(5);
+/// Maximum number of requests served on a single connection before it is
+/// closed. Prevents a single long-lived client from monopolizing the
+/// single-threaded daemon indefinitely.
+const MAX_REQUESTS_PER_CONN: u32 = 64;
 
 /// $TMPDIR/gitpixel-<xxh3-of-canonical-root>.sock
 pub fn socket_path(root: &Path) -> PathBuf {
@@ -84,7 +94,11 @@ pub fn run(root: &Path) -> Result<(), ServeError> {
         .watch(&root, RecursiveMode::Recursive)
         .map_err(|e| ServeError::Msg(format!("watch {}: {e}", root.display())))?;
 
-    eprintln!("gitpixel daemon: root={} socket={}", root.display(), sock.display());
+    eprintln!(
+        "gitpixel daemon: root={} socket={}",
+        root.display(),
+        sock.display()
+    );
 
     // rel path -> removed?
     let mut pending: BTreeMap<String, bool> = BTreeMap::new();
@@ -117,17 +131,17 @@ pub fn run(root: &Path) -> Result<(), ServeError> {
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         }
 
-        if let Some(at) = flush_at {
-            if Instant::now() >= at {
-                for (rel, removed) in std::mem::take(&mut pending) {
-                    if removed {
-                        service.remove_file(&rel);
-                    } else {
-                        service.refresh_file(&rel);
-                    }
+        if let Some(at) = flush_at
+            && Instant::now() >= at
+        {
+            for (rel, removed) in std::mem::take(&mut pending) {
+                if removed {
+                    service.remove_file(&rel);
+                } else {
+                    service.refresh_file(&rel);
                 }
-                flush_at = None;
             }
+            flush_at = None;
         }
 
         if last_activity.elapsed() >= IDLE_TIMEOUT {
@@ -143,7 +157,9 @@ pub fn run(root: &Path) -> Result<(), ServeError> {
 
 fn record_event(root: &Path, ev: &notify::Event, pending: &mut BTreeMap<String, bool>) {
     for path in &ev.paths {
-        let Ok(rel) = path.strip_prefix(root) else { continue };
+        let Ok(rel) = path.strip_prefix(root) else {
+            continue;
+        };
         if rel.components().any(|c| match c {
             Component::Normal(s) => IGNORED_DIRS.iter().any(|d| s == *d),
             _ => false,
@@ -153,8 +169,7 @@ fn record_event(root: &Path, ev: &notify::Event, pending: &mut BTreeMap<String, 
         if path.is_dir() {
             continue;
         }
-        let removed =
-            matches!(ev.kind, notify::EventKind::Remove(_)) || !path.exists();
+        let removed = matches!(ev.kind, notify::EventKind::Remove(_)) || !path.exists();
         let rel = rel.to_string_lossy().into_owned();
         if rel.is_empty() {
             continue;
@@ -165,20 +180,44 @@ fn record_event(root: &Path, ev: &notify::Event, pending: &mut BTreeMap<String, 
 }
 
 fn handle_conn(service: &mut Service, stream: UnixStream, shutdown: &mut bool) {
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(60)));
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(1)));
     let mut reader = BufReader::new(match stream.try_clone() {
         Ok(s) => s,
         Err(_) => return,
     });
     let mut writer = stream;
     let mut line = String::new();
+    let mut request_count: u32 = 0;
+    let deadline = Instant::now() + CONNECTION_DEADLINE;
     loop {
-        line.clear();
-        match reader.read_line(&mut line) {
-            Ok(0) => break, // EOF
-            Ok(_) => {}
-            Err(_) => break,
+        // Cap requests per connection to prevent starvation.
+        if request_count >= MAX_REQUESTS_PER_CONN {
+            let _ = writer
+                .write_all(b"{\"ok\":false,\"error\":\"request limit exceeded\",\"data\":null}\n");
+            break;
         }
+        line.clear();
+        // Cap line length: read in chunks and abort if the line exceeds the
+        // limit, so a multi-GB line cannot exhaust memory.
+        match read_capped_line(&mut reader, &mut line, MAX_REQUEST_LINE, deadline) {
+            ReadResult::Ok => {}
+            ReadResult::Eof => break,
+            ReadResult::TooLong => {
+                let _ = writer.write_all(
+                    b"{\"ok\":false,\"error\":\"request line too long\",\"data\":null}\n",
+                );
+                break;
+            }
+            ReadResult::InvalidUtf8 => {
+                request_count += 1;
+                let _ = writer.write_all(
+                    b"{\"ok\":false,\"error\":\"request is not valid UTF-8\",\"data\":null}\n",
+                );
+                continue;
+            }
+            ReadResult::TimedOut | ReadResult::Err => break,
+        }
+        request_count += 1;
         let trimmed = line.trim();
         if trimmed.is_empty() {
             continue;
@@ -201,5 +240,109 @@ fn handle_conn(service: &mut Service, stream: UnixStream, shutdown: &mut bool) {
             *shutdown = true;
             break;
         }
+    }
+}
+
+enum ReadResult {
+    Ok,
+    Eof,
+    TooLong,
+    InvalidUtf8,
+    TimedOut,
+    Err,
+}
+
+/// Read one line into `buf`, returning `TooLong` if it exceeds `max_bytes`
+/// before a newline is found. The trailing newline is consumed but not
+/// included in `buf` (same semantics as `read_line` minus the newline).
+fn read_capped_line(
+    reader: &mut BufReader<std::os::unix::net::UnixStream>,
+    buf: &mut String,
+    max_bytes: usize,
+    deadline: Instant,
+) -> ReadResult {
+    use std::io::Read;
+    let mut bytes = Vec::with_capacity(max_bytes.min(4096));
+    let mut byte = [0u8; 1];
+    loop {
+        if Instant::now() >= deadline {
+            return ReadResult::TimedOut;
+        }
+        match reader.read(&mut byte) {
+            Ok(0) => {
+                if bytes.is_empty() {
+                    return ReadResult::Eof;
+                }
+                break;
+            }
+            Ok(_) => {
+                if byte[0] == b'\n' {
+                    break;
+                }
+                bytes.push(byte[0]);
+                if bytes.len() > max_bytes {
+                    return ReadResult::TooLong;
+                }
+            }
+            Err(_) => return ReadResult::Err,
+        }
+    }
+    match String::from_utf8(bytes) {
+        Ok(line) => {
+            *buf = line;
+            ReadResult::Ok
+        }
+        Err(_) => ReadResult::InvalidUtf8,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn capped_line_preserves_utf8() {
+        let (mut writer, reader) = UnixStream::pair().unwrap();
+        writer.write_all("📋\n".as_bytes()).unwrap();
+        let mut reader = BufReader::new(reader);
+        let mut line = String::new();
+        assert!(matches!(
+            read_capped_line(
+                &mut reader,
+                &mut line,
+                16,
+                Instant::now() + Duration::from_secs(1)
+            ),
+            ReadResult::Ok
+        ));
+        assert_eq!(line, "📋");
+    }
+
+    #[test]
+    fn oversized_line_is_rejected_without_unbounded_drain() {
+        let (mut writer, reader) = UnixStream::pair().unwrap();
+        writer.write_all(b"0123456789\nnext\n").unwrap();
+        let mut reader = BufReader::new(reader);
+        let mut line = String::new();
+        assert!(matches!(
+            read_capped_line(
+                &mut reader,
+                &mut line,
+                4,
+                Instant::now() + Duration::from_secs(1)
+            ),
+            ReadResult::TooLong
+        ));
+    }
+
+    #[test]
+    fn expired_connection_deadline_stops_frame_read() {
+        let (_writer, reader) = UnixStream::pair().unwrap();
+        let mut reader = BufReader::new(reader);
+        let mut line = String::new();
+        assert!(matches!(
+            read_capped_line(&mut reader, &mut line, 4, Instant::now()),
+            ReadResult::TimedOut
+        ));
     }
 }

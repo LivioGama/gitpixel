@@ -15,12 +15,12 @@ use std::path::{Path, PathBuf};
 
 use rayon::prelude::*;
 
-use crate::delta::{delta_shard_path, DeltaState};
+use crate::delta::{DeltaState, delta_shard_path};
 use crate::gram::GramExtractor;
-use crate::index::{SearchStats, SHARD_DIR, SHARD_FILE};
+use crate::index::{MAX_FILE_BYTES, SHARD_DIR, SHARD_FILE, SearchStats, read_regular_bounded};
 use crate::overlay::Overlay;
 use crate::plan::plan_pattern;
-use crate::posting::{resolve_query, GramQuery};
+use crate::posting::{GramQuery, resolve_query};
 use crate::shard::{Shard, ShardBuilder, ShardError};
 use crate::verify::{MatchLine, Verifier, VerifyError};
 use crate::{gitsync, index};
@@ -92,13 +92,86 @@ fn is_internal(rel: &str) -> bool {
     rel == SHARD_DIR || rel.starts_with(&format!("{SHARD_DIR}/"))
 }
 
-/// Read + extract one file for shard building. `None` = unreadable or binary.
-fn extract_file(
+/// Sidecar path for the plain-walk freshness signature.
+fn plain_sig_path(gpx_dir: &Path) -> PathBuf {
+    gpx_dir.join("base.sig")
+}
+
+/// Content signature for a non-Git directory. The same ignore, binary, size,
+/// and symlink policy as the index builder keeps freshness tied to the bytes
+/// that can actually appear in search results.
+fn plain_signature(root: &Path) -> String {
+    use std::hash::Hasher;
+    let mut entries: Vec<(String, u64)> = ignore::WalkBuilder::new(root)
+        .hidden(true)
+        .build()
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let path = entry.path();
+            let rel = path.strip_prefix(root).ok()?.to_string_lossy().into_owned();
+            if is_internal(&rel) {
+                return None;
+            }
+            let meta = std::fs::symlink_metadata(path).ok()?;
+            if !meta.file_type().is_file() || meta.len() > MAX_FILE_BYTES {
+                return None;
+            }
+            let content = std::fs::read(path).ok()?;
+            if content[..content.len().min(8192)].contains(&0) {
+                return None;
+            }
+            Some((rel, xxhash_rust::xxh3::xxh3_64(&content)))
+        })
+        .collect();
+    entries.sort();
+    let mut h = xxhash_rust::xxh3::Xxh3::new();
+    for (rel, content_hash) in &entries {
+        h.write(rel.as_bytes());
+        h.write(&content_hash.to_le_bytes());
+    }
+    format!("{:016x}", h.finish())
+}
+
+/// Load the stored plain-walk signature, or `None` if absent/corrupt.
+fn load_plain_sig(gpx_dir: &Path) -> Option<String> {
+    let bytes = read_regular_bounded(&plain_sig_path(gpx_dir), 128).ok()?;
+    let sig = String::from_utf8(bytes).ok()?;
+    (!sig.is_empty()).then_some(sig)
+}
+
+fn save_plain_sig(gpx_dir: &Path, sig: &str) {
+    let _ = std::fs::create_dir_all(gpx_dir);
+    let _ = std::fs::write(plain_sig_path(gpx_dir), sig);
+}
+
+/// True iff `p` is a regular file (not a symlink, not a directory). Symlinks
+/// are rejected even when they point at a regular file, so a tracked symlink
+/// can never expose content outside the repository through the verifier.
+fn is_regular_file(p: &Path) -> bool {
+    std::fs::symlink_metadata(p)
+        .map(|metadata| metadata.file_type().is_file() && metadata.len() <= MAX_FILE_BYTES)
+        .unwrap_or(false)
+}
+
+/// Read + extract one blob straight from the git object store at `commit_oid`.
+/// This is what makes the base/delta shards truly git-anchored: their bytes
+/// come from the commit, not the working tree, so a dirty-then-reverted file
+/// can never poison a shard labeled with that commit. Symlinks stored in git
+/// are returned as their target text (a few bytes) and skipped as binary-ish
+/// noise; they never traverse the filesystem.
+fn extract_blob(
     root: &Path,
+    commit_oid: &str,
     rel: &str,
     extractor: &dyn GramExtractor,
 ) -> Option<(String, Vec<u64>)> {
-    let content = std::fs::read(root.join(rel)).ok()?;
+    if gitsync::blob_size(root, commit_oid, rel)? > MAX_FILE_BYTES {
+        return None;
+    }
+    let content = gitsync::show_blob(root, commit_oid, rel)?;
+    if content.is_empty() {
+        return None;
+    }
     if content[..content.len().min(8192)].contains(&0) {
         return None;
     }
@@ -110,7 +183,8 @@ fn extract_file(
     Some((rel.to_string(), hashes))
 }
 
-/// Build a shard from an explicit repo-relative file list (parallel extract).
+/// Build a git-anchored shard from an explicit repo-relative file list,
+/// extracting every blob from the git object store at `commit_oid` (parallel).
 fn build_shard_from(
     root: &Path,
     rel_paths: &[String],
@@ -121,7 +195,7 @@ fn build_shard_from(
     let mut extracted: Vec<(String, Vec<u64>)> = rel_paths
         .par_iter()
         .filter(|rel| !is_internal(rel))
-        .filter_map(|rel| extract_file(root, rel, extractor))
+        .filter_map(|rel| extract_blob(root, commit_oid, rel, extractor))
         .collect();
     extracted.sort_by(|a, b| a.0.cmp(&b.0));
     let mut builder = ShardBuilder::new(&extractor.id());
@@ -153,6 +227,15 @@ impl IndexSet {
         if head.is_some() && base.as_ref().is_some_and(|s| s.commit_oid().is_none()) {
             base = None;
         }
+        // Non-Git repos: the base shard has no commit anchor, so it can go
+        // stale when files are added/removed/edited. Invalidate it when the
+        // directory signature has changed (or is missing on first open).
+        if head.is_none()
+            && base.as_ref().is_some_and(|s| s.commit_oid().is_none())
+            && load_plain_sig(&gpx_dir).as_deref() != Some(&plain_signature(root))
+        {
+            base = None;
+        }
         let base = match base {
             Some(s) => s,
             None => {
@@ -162,13 +245,8 @@ impl IndexSet {
                 match &head {
                     Some(oid) => {
                         let tracked = gitsync::ls_files(root);
-                        let shard = build_shard_from(
-                            root,
-                            &tracked,
-                            extractor.as_ref(),
-                            oid,
-                            &base_path,
-                        )?;
+                        let shard =
+                            build_shard_from(root, &tracked, extractor.as_ref(), oid, &base_path)?;
                         DeltaState {
                             base_oid: oid.clone(),
                             delta_oid: None,
@@ -179,7 +257,9 @@ impl IndexSet {
                     }
                     None => {
                         index::build(root, extractor.as_ref())?;
-                        Shard::open(&base_path)?
+                        let shard = Shard::open(&base_path)?;
+                        save_plain_sig(&gpx_dir, &plain_signature(root));
+                        shard
                     }
                 }
             }
@@ -229,16 +309,15 @@ impl IndexSet {
     ) -> Result<(), IndexSetError> {
         let delta_path = delta_shard_path(gpx_dir);
         // Reuse a delta already pinned to this exact HEAD.
-        if let Some(state) = DeltaState::load(gpx_dir) {
-            if state.base_oid == base_oid && state.delta_oid.as_deref() == Some(head_oid) {
-                if let Ok(s) = Shard::open(&delta_path) {
-                    if s.extractor_id() == self.extractor.id() {
-                        self.delta_tombstones = state.tombstones.into_iter().collect();
-                        self.delta = Some(s);
-                        return Ok(());
-                    }
-                }
-            }
+        if let Some(state) = DeltaState::load(gpx_dir)
+            && state.base_oid == base_oid
+            && state.delta_oid.as_deref() == Some(head_oid)
+            && let Ok(s) = Shard::open(&delta_path)
+            && s.extractor_id() == self.extractor.id()
+        {
+            self.delta_tombstones = state.tombstones.into_iter().collect();
+            self.delta = Some(s);
+            return Ok(());
         }
         // Cumulative diff base..HEAD — simple and correct however HEAD moved.
         let diff = gitsync::diff_name_status(&self.root, base_oid, head_oid);
@@ -295,7 +374,43 @@ impl IndexSet {
 
     /// Merge-order query: base ∪ delta candidates − tombstones + overlay
     /// matches → verify every survivor with the real regex.
-    pub fn search(&self, pattern: &str) -> Result<(Vec<MatchLine>, SearchStats), IndexSetError> {
+    ///
+    /// `limit` caps the number of matches returned. When set, verification
+    /// proceeds in path-sorted chunks and stops as soon as `limit` matches
+    /// have been found (early stop), so a broad pattern over a huge tree
+    /// cannot run unbounded. `stats.truncated` is set when more matches exist
+    /// beyond the returned slice. `None` means no limit (verify everything in
+    /// one parallel pass).
+    pub fn search(
+        &self,
+        pattern: &str,
+        limit: Option<usize>,
+    ) -> Result<(Vec<MatchLine>, SearchStats), IndexSetError> {
+        self.search_page(pattern, 0, limit)
+    }
+
+    /// Search a stable path/line-ordered page without retaining skipped
+    /// matches. `offset` counts matching lines, not candidate files.
+    pub fn search_page(
+        &self,
+        pattern: &str,
+        offset: usize,
+        limit: Option<usize>,
+    ) -> Result<(Vec<MatchLine>, SearchStats), IndexSetError> {
+        self.search_page_in(pattern, offset, limit, None)
+    }
+
+    /// `search_page` restricted to repo-relative path prefixes (component-wise,
+    /// so `src/foo` never matches `src/foobar`). `None`/empty = whole repo.
+    /// Filtering happens before verification and before the row limit, so
+    /// pagination stays correct within the requested subtrees.
+    pub fn search_page_in(
+        &self,
+        pattern: &str,
+        offset: usize,
+        limit: Option<usize>,
+        path_prefixes: Option<&[String]>,
+    ) -> Result<(Vec<MatchLine>, SearchStats), IndexSetError> {
         let started = std::time::Instant::now();
         let query = plan_pattern(pattern, self.extractor.as_ref())
             .map_err(|e| IndexSetError::Pattern(e.to_string()))?;
@@ -304,19 +419,20 @@ impl IndexSet {
         let mut paths: BTreeSet<String> = BTreeSet::new();
         // Base candidates, minus everything superseded by newer layers.
         for id in resolve_query(&query, self.base.file_count(), &|h| self.base.postings(h)) {
-            if let Some(p) = self.base.path_of(id) {
-                if !self.delta_tombstones.contains(p) && !self.overlay.tombstones.contains(p) {
-                    paths.insert(p.to_string());
-                }
+            if let Some(p) = self.base.path_of(id)
+                && !self.delta_tombstones.contains(p)
+                && !self.overlay.tombstones.contains(p)
+            {
+                paths.insert(p.to_string());
             }
         }
         // Delta candidates, minus dirty-overlay supersessions.
         if let Some(delta) = &self.delta {
             for id in resolve_query(&query, delta.file_count(), &|h| delta.postings(h)) {
-                if let Some(p) = delta.path_of(id) {
-                    if !self.overlay.tombstones.contains(p) {
-                        paths.insert(p.to_string());
-                    }
+                if let Some(p) = delta.path_of(id)
+                    && !self.overlay.tombstones.contains(p)
+                {
+                    paths.insert(p.to_string());
                 }
             }
         }
@@ -325,28 +441,67 @@ impl IndexSet {
             paths.insert(p.to_string());
         }
 
-        let candidates: Vec<String> = paths.into_iter().collect();
+        let mut candidates: Vec<String> = paths.into_iter().collect();
+        if let Some(prefixes) = path_prefixes
+            && !prefixes.is_empty()
+        {
+            candidates.retain(|rel| {
+                let rel_path = std::path::Path::new(rel);
+                prefixes
+                    .iter()
+                    .any(|p| p.is_empty() || rel_path.starts_with(p))
+            });
+        }
         let verifier = Verifier::new(pattern)?;
-        let results: Vec<Vec<MatchLine>> = candidates
-            .par_iter()
-            .filter_map(|rel| {
-                let abs = self.root.join(rel);
-                if !abs.is_file() {
-                    return None; // deleted since indexing; skip.
-                }
-                let mut out = Vec::new();
-                verifier.search_file(&abs, rel, &mut out).ok()?;
-                (!out.is_empty()).then_some(out)
-            })
-            .collect();
 
-        let mut matches: Vec<MatchLine> = results.into_iter().flatten().collect();
-        matches.sort_by(|a, b| a.path.cmp(&b.path).then(a.line_number.cmp(&b.line_number)));
+        // Limited verification searches sorted files until one match beyond
+        // the requested limit is observed. That bounds retained matches and
+        // makes `truncated` exact: remaining candidates alone are not proof
+        // that another match exists.
+        let mut matches: Vec<MatchLine> = Vec::new();
+        let mut truncated = false;
+        if let Some(limit) = limit {
+            let probe_target = limit.saturating_add(1);
+            let mut skip = offset;
+            for rel in &candidates {
+                let abs = self.root.join(rel);
+                if !is_regular_file(&abs) {
+                    continue;
+                }
+                let remaining = probe_target.saturating_sub(matches.len());
+                if remaining == 0 {
+                    break;
+                }
+                verifier.search_file_page(&abs, rel, &mut matches, &mut skip, Some(remaining))?;
+                if matches.len() > limit {
+                    truncated = true;
+                    matches.truncate(limit);
+                    break;
+                }
+            }
+        } else {
+            let results: Vec<Vec<MatchLine>> = candidates
+                .par_iter()
+                .filter_map(|rel| {
+                    let abs = self.root.join(rel);
+                    if !is_regular_file(&abs) {
+                        return None;
+                    }
+                    let mut out = Vec::new();
+                    verifier.search_file(&abs, rel, &mut out, None).ok()?;
+                    (!out.is_empty()).then_some(out)
+                })
+                .collect();
+            matches = results.into_iter().flatten().collect();
+            matches.sort_by(|a, b| a.path.cmp(&b.path).then(a.line_number.cmp(&b.line_number)));
+        }
+
         let stats = SearchStats {
             candidates: candidates.len(),
             scanned_all,
             matches: matches.len(),
             elapsed_us: started.elapsed().as_micros(),
+            truncated,
         };
         Ok((matches, stats))
     }
@@ -403,7 +558,7 @@ mod tests {
         let st = set.status();
         assert!(st.commit_oid.is_some());
         assert_eq!(st.base_files, 2);
-        let (m, _) = set.search("handleClick").unwrap();
+        let (m, _) = set.search("handleClick", None).unwrap();
         assert_eq!(m.len(), 1);
         assert_eq!(m[0].path, "alpha.rs");
 
@@ -415,26 +570,26 @@ mod tests {
         let set = IndexSet::open_or_build(&dir, ex()).unwrap();
         let st = set.status();
         assert_eq!(st.delta_files, 2, "alpha (modified) + gamma (added)");
-        let (m, _) = set.search("freshDeltaSymbol").unwrap();
+        let (m, _) = set.search("freshDeltaSymbol", None).unwrap();
         assert_eq!(m.len(), 1);
         assert_eq!(m[0].path, "gamma.rs");
-        let (m, _) = set.search("handleClick").unwrap();
+        let (m, _) = set.search("handleClick", None).unwrap();
         assert!(m.is_empty(), "old base content is tombstoned by the delta");
 
         // Overlay: uncommitted edit is visible without a rebuild.
         let mut set = set;
         std::fs::write(dir.join("beta.rs"), "fn overlayOnlySymbol() {}\n").unwrap();
         set.refresh_file("beta.rs");
-        let (m, _) = set.search("overlayOnlySymbol").unwrap();
+        let (m, _) = set.search("overlayOnlySymbol", None).unwrap();
         assert_eq!(m.len(), 1);
         assert_eq!(m[0].path, "beta.rs");
-        let (m, _) = set.search("openMenuWidget").unwrap();
+        let (m, _) = set.search("openMenuWidget", None).unwrap();
         assert!(m.is_empty(), "overlay tombstones the stale base entry");
 
         // remove_file tombstones everywhere.
         std::fs::remove_file(dir.join("gamma.rs")).unwrap();
         set.remove_file("gamma.rs");
-        let (m, _) = set.search("freshDeltaSymbol").unwrap();
+        let (m, _) = set.search("freshDeltaSymbol", None).unwrap();
         assert!(m.is_empty());
 
         std::fs::remove_dir_all(&dir).ok();
@@ -449,9 +604,267 @@ mod tests {
 
         let set = IndexSet::open_or_build(&dir, ex()).unwrap();
         assert!(set.status().commit_oid.is_none());
-        let (m, _) = set.search("plainWalkNeedle").unwrap();
+        let (m, _) = set.search("plainWalkNeedle", None).unwrap();
         assert_eq!(m.len(), 1);
         assert_eq!(m[0].path, "solo.txt");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Regression: non-Git directories must detect file changes on reopen
+    /// and rebuild the base shard. Previously the base was reused without
+    /// checking freshness, so new/edited files were invisible after reopening.
+    #[test]
+    fn non_git_reopen_detects_changes() {
+        let dir = std::env::temp_dir().join(format!(
+            "gpx-indexset-nongit-stale-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+                % 1_000_000
+        ));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Initial build with one file.
+        std::fs::write(dir.join("a.txt"), "firstNeedle here\n").unwrap();
+        let set = IndexSet::open_or_build(&dir, ex()).unwrap();
+        let (m, _) = set.search("firstNeedle", None).unwrap();
+        assert_eq!(m.len(), 1, "initial file must be indexed");
+
+        // Add a new file and edit the existing one. Without reopening in the
+        // same process, we simulate a cold reopen by dropping and rebuilding.
+        std::fs::write(dir.join("b.txt"), "secondNeedle here\n").unwrap();
+        std::fs::write(dir.join("a.txt"), "firstNeedle editedContent\n").unwrap();
+
+        // Reopen: the signature check must detect the changes and rebuild.
+        let set = IndexSet::open_or_build(&dir, ex()).unwrap();
+        let (m, _) = set.search("secondNeedle", None).unwrap();
+        assert_eq!(
+            m.len(),
+            1,
+            "new file must be visible after reopen (non-Git staleness fix)"
+        );
+        assert_eq!(m[0].path, "b.txt");
+        let (m, _) = set.search("editedContent", None).unwrap();
+        assert_eq!(m.len(), 1, "edited content must be visible after reopen");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn non_git_reopen_detects_equal_size_edit_with_restored_mtime() {
+        let dir = std::env::temp_dir().join(format!(
+            "gpx-indexset-nongit-content-{}",
+            std::process::id()
+        ));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        let source = dir.join("a.txt");
+        let reference = dir.join("mtime-reference");
+        std::fs::write(&source, "oldSameSizeNeedle\n").unwrap();
+        std::fs::write(&reference, "reference\n").unwrap();
+        assert!(
+            std::process::Command::new("touch")
+                .args(["-r"])
+                .arg(&source)
+                .arg(&reference)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let _ = IndexSet::open_or_build(&dir, ex()).unwrap();
+        std::fs::write(&source, "newSameSizeNeedle\n").unwrap();
+        assert!(
+            std::process::Command::new("touch")
+                .args(["-r"])
+                .arg(&reference)
+                .arg(&source)
+                .status()
+                .unwrap()
+                .success()
+        );
+
+        let set = IndexSet::open_or_build(&dir, ex()).unwrap();
+        let (new_matches, _) = set.search("newSameSizeNeedle", None).unwrap();
+        let (old_matches, _) = set.search("oldSameSizeNeedle", None).unwrap();
+        assert_eq!(new_matches.len(), 1);
+        assert!(old_matches.is_empty());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Regression: base shard must be git-anchored — its bytes come from the
+    /// commit, not the working tree. The bug was: rebuild on a dirty working
+    /// tree indexed dirty bytes but labeled them as HEAD, so restoring the
+    /// file caused a false-negative (the committed content was no longer in
+    /// the index). With the fix, rebuilding on a dirty tree still indexes the
+    /// commit's bytes, so after restoring the file the committed content is
+    /// searchable again.
+    #[test]
+    fn base_shard_uses_commit_bytes_not_working_tree() {
+        let dir = std::env::temp_dir().join(format!(
+            "gpx-indexset-prov-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+                % 1_000_000
+        ));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        git(&dir, &["init", "-q"]);
+        std::fs::write(dir.join("src.rs"), "fn committedNeedle() {}\n").unwrap();
+        git(&dir, &["add", "."]);
+        git(&dir, &["commit", "-qm", "one"]);
+
+        // Build the base shard — it must contain the committed content.
+        let set = IndexSet::open_or_build(&dir, ex()).unwrap();
+        let (m, _) = set.search("committedNeedle", None).unwrap();
+        assert_eq!(m.len(), 1, "committed content must be indexed at HEAD");
+
+        // Dirty the working tree, then force a base rebuild by removing the
+        // shard. The OLD behavior indexed the dirty bytes as HEAD; the fix
+        // indexes the commit's bytes.
+        std::fs::write(dir.join("src.rs"), "fn dirtyUnrelatedContent() {}\n").unwrap();
+        std::fs::remove_file(dir.join(".gitpixel").join("base.shard")).unwrap();
+        let _set = IndexSet::open_or_build(&dir, ex()).unwrap();
+
+        // Restore the file to its committed content (git checkout).
+        git(&dir, &["checkout", "--", "src.rs"]);
+        let set = IndexSet::open_or_build(&dir, ex()).unwrap();
+        let (m, _) = set.search("committedNeedle", None).unwrap();
+        assert_eq!(
+            m.len(),
+            1,
+            "base shard must be git-anchored: after restore, committed content must be searchable"
+        );
+        // The dirty content must NOT be in the base shard.
+        let (m, _) = set.search("dirtyUnrelatedContent", None).unwrap();
+        assert!(
+            m.is_empty(),
+            "dirty working-tree content must not appear in the base shard (it was never committed)"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Regression: a tracked symlink pointing outside the repository must never
+    /// expose its target's content through search. The symlink is rejected at
+    /// extraction (so it is not indexed) and at verification (so even if a
+    /// candidate path slipped through, the target is not read).
+    #[cfg(unix)]
+    #[test]
+    fn symlink_escape_is_blocked() {
+        use std::os::unix::fs::symlink;
+        let dir = std::env::temp_dir().join(format!(
+            "gpx-indexset-symlink-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+                % 1_000_000
+        ));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        git(&dir, &["init", "-q"]);
+
+        // External file with a unique needle that must never be searchable
+        // through the repo's index.
+        let external = std::env::temp_dir().join(format!(
+            "gpx-ext-{}-{}.txt",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+                % 1_000_000
+        ));
+        std::fs::write(&external, "externalSymlinkTargetNeedle\n").unwrap();
+
+        // A regular tracked file (so the repo has at least one real file).
+        std::fs::write(dir.join("real.rs"), "fn realRepoNeedle() {}\n").unwrap();
+        // A symlink tracked by git that points outside the repo.
+        symlink(&external, dir.join("escape.txt")).unwrap();
+        git(&dir, &["add", "."]);
+        git(&dir, &["commit", "-qm", "with symlink"]);
+
+        let set = IndexSet::open_or_build(&dir, ex()).unwrap();
+        // The regular file is searchable.
+        let (m, _) = set.search("realRepoNeedle", None).unwrap();
+        assert_eq!(m.len(), 1);
+        // The external needle must NOT be searchable through the symlink.
+        let (m, _) = set.search("externalSymlinkTargetNeedle", None).unwrap();
+        assert!(
+            m.is_empty(),
+            "symlink escape: external target content must not be indexed or verified"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_file(&external).ok();
+    }
+
+    #[test]
+    fn oversized_worktree_file_is_not_indexed_or_verified() {
+        let dir =
+            std::env::temp_dir().join(format!("gpx-indexset-oversized-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("small.rs"), "fn boundedNeedle() {}\n").unwrap();
+        let mut oversized = vec![b'x'; MAX_FILE_BYTES as usize + 1];
+        let needle = b"oversizedNeedle";
+        oversized[..needle.len()].copy_from_slice(needle);
+        std::fs::write(dir.join("large.rs"), oversized).unwrap();
+
+        let set = IndexSet::open_or_build(&dir, ex()).unwrap();
+        let (small, _) = set.search("boundedNeedle", None).unwrap();
+        let (large, _) = set.search("oversizedNeedle", None).unwrap();
+        assert_eq!(small.len(), 1);
+        assert!(large.is_empty());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Regression: a search with a row limit returns at most `limit` matches
+    /// and reports `truncated` when more matches exist beyond the slice.
+    #[test]
+    fn search_limit_truncates() {
+        let dir = std::env::temp_dir().join(format!(
+            "gpx-indexset-limit-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+                % 1_000_000
+        ));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        git(&dir, &["init", "-q"]);
+        // Many files, each with the same needle, so a broad pattern hits all.
+        for i in 0..20 {
+            std::fs::write(
+                dir.join(format!("f{i:02}.rs")),
+                format!("fn sharedLimitNeedle{i:02}() {{}}\n"),
+            )
+            .unwrap();
+        }
+        git(&dir, &["add", "."]);
+        git(&dir, &["commit", "-qm", "many"]);
+
+        let set = IndexSet::open_or_build(&dir, ex()).unwrap();
+        // Limit of 5: at most 5 matches returned, truncated=true.
+        let (m, stats) = set.search("sharedLimitNeedle", Some(5)).unwrap();
+        assert!(m.len() <= 5, "limit must cap returned matches");
+        assert_eq!(stats.matches, m.len());
+        assert!(stats.truncated, "truncated must be true when capped");
+        // No limit: all 20 matches returned, truncated=false.
+        let (m, stats) = set.search("sharedLimitNeedle", None).unwrap();
+        assert_eq!(m.len(), 20);
+        assert!(!stats.truncated);
+
         std::fs::remove_dir_all(&dir).ok();
     }
 }

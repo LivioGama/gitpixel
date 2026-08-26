@@ -139,7 +139,11 @@ fn top_keywords(names: &[String], k: usize) -> String {
     }
     let mut v: Vec<(String, usize)> = freq.into_iter().collect();
     v.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
-    v.into_iter().take(k).map(|(w, _)| w).collect::<Vec<_>>().join(",")
+    v.into_iter()
+        .take(k)
+        .map(|(w, _)| w)
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 /// Recompute clusters from scratch: clears `clusters`/`cluster_members`,
@@ -246,21 +250,36 @@ pub fn compute(store: &mut GraphStore) -> Result<Vec<ClusterSummary>, StoreError
     Ok(out)
 }
 
-/// List persisted clusters.
-pub fn list(store: &GraphStore) -> Result<Vec<ClusterSummary>, StoreError> {
+/// List at most `limit` persisted clusters. The returned total is the number
+/// of persisted clusters before limiting.
+pub fn list(
+    store: &GraphStore,
+    limit: usize,
+    offset: usize,
+) -> Result<(Vec<ClusterSummary>, usize), StoreError> {
+    let total = store
+        .conn()
+        .query_row("SELECT COUNT(*) FROM clusters", [], |r| r.get::<_, i64>(0))?
+        .max(0) as usize;
     let mut stmt = store.conn().prepare(
         "SELECT c.id, c.label, c.cohesion, c.keywords,
                 (SELECT COUNT(*) FROM cluster_members m WHERE m.cluster_id = c.id)
-         FROM clusters c ORDER BY c.id",
+         FROM clusters c ORDER BY c.id LIMIT ?1 OFFSET ?2",
     )?;
-    let rows = stmt.query_map([], |r| {
-        Ok(ClusterSummary {
-            id: r.get(0)?,
-            label: r.get(1)?,
-            cohesion: r.get(2)?,
-            keywords: r.get(3)?,
-            symbol_count: r.get::<_, i64>(4)? as u64,
-        })
-    })?;
-    Ok(rows.collect::<std::result::Result<_, _>>()?)
+    let rows = stmt.query_map(
+        params![
+            limit.min(i64::MAX as usize) as i64,
+            offset.min(i64::MAX as usize) as i64
+        ],
+        |r| {
+            Ok(ClusterSummary {
+                id: r.get(0)?,
+                label: r.get(1)?,
+                cohesion: r.get(2)?,
+                keywords: r.get(3)?,
+                symbol_count: r.get::<_, i64>(4)? as u64,
+            })
+        },
+    )?;
+    Ok((rows.collect::<std::result::Result<_, _>>()?, total))
 }

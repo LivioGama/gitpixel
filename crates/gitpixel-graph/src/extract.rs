@@ -32,6 +32,11 @@ pub struct RawCall {
 #[derive(Debug, Clone)]
 pub struct RawImport {
     pub spec: String,
+    /// Named bindings imported from this spec (e.g. `["greet", "farewell"]`
+    /// for `import { greet, farewell } from "./a"`). Empty for wildcard
+    /// imports (`import * as x`) or when bindings cannot be extracted. Empty
+    /// bindings never grant Exact import-tier confidence.
+    pub bindings: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -194,9 +199,9 @@ impl<'a> Walker<'a> {
         });
     }
 
-    fn push_import(&mut self, spec: String) {
+    fn push_import(&mut self, spec: String, bindings: Vec<String>) {
         if !spec.is_empty() {
-            self.imports.push(RawImport { spec });
+            self.imports.push(RawImport { spec, bindings });
         }
     }
 }
@@ -213,7 +218,8 @@ fn field_text(w: &Walker, n: Node, field: &str) -> Option<String> {
 }
 
 fn strip_quotes(s: &str) -> String {
-    s.trim_matches(|c| c == '"' || c == '\'' || c == '`').to_string()
+    s.trim_matches(|c| c == '"' || c == '\'' || c == '`')
+        .to_string()
 }
 
 fn each_child<'t>(n: Node<'t>) -> Vec<Node<'t>> {
@@ -265,16 +271,18 @@ fn walk_ts(w: &mut Walker, node: Node, depth: usize) {
             let is_fn = node
                 .child_by_field_name("value")
                 .map(|v| {
-                    matches!(v.kind(), "arrow_function" | "function_expression" | "function")
+                    matches!(
+                        v.kind(),
+                        "arrow_function" | "function_expression" | "function"
+                    )
                 })
                 .unwrap_or(false);
-            if is_fn {
-                if let Some(name) = field_text(w, node, "name") {
-                    if !name.contains(['{', '[']) {
-                        let q = w.qualify(&name, ".");
-                        w.push_symbol(name, q, SymbolKind::Function, node);
-                    }
-                }
+            if is_fn
+                && let Some(name) = field_text(w, node, "name")
+                && !name.contains(['{', '['])
+            {
+                let q = w.qualify(&name, ".");
+                w.push_symbol(name, q, SymbolKind::Function, node);
             }
         }
         "call_expression" => {
@@ -295,17 +303,18 @@ fn walk_ts(w: &mut Walker, node: Node, depth: usize) {
             }
         }
         "new_expression" => {
-            if let Some(c) = node.child_by_field_name("constructor") {
-                if c.kind() == "identifier" {
-                    let name = w.text(c);
-                    w.push_call(name, None, node);
-                }
+            if let Some(c) = node.child_by_field_name("constructor")
+                && c.kind() == "identifier"
+            {
+                let name = w.text(c);
+                w.push_call(name, None, node);
             }
         }
         "import_statement" | "export_statement" => {
             if let Some(src) = node.child_by_field_name("source") {
                 let spec = strip_quotes(&w.text(src));
-                w.push_import(spec);
+                let bindings = ts_import_bindings(w, node);
+                w.push_import(spec, bindings);
             }
         }
         _ => {}
@@ -318,10 +327,76 @@ fn walk_ts(w: &mut Walker, node: Node, depth: usize) {
     }
 }
 
+/// Extract named import bindings from a TS/JS `import_statement` or
+/// `export_statement ... from "..."`. Handles:
+/// - `import { greet, farewell } from "./a"` → `["greet", "farewell"]`
+/// - `import greet from "./a"` → `["greet"]` (default import)
+/// - `import * as ns from "./a"` → `[]` (wildcard — no tracked bindings)
+/// - `import greet, { helper } from "./a"` → `["greet", "helper"]`
+///
+/// Returns empty for wildcard imports and unparseable forms; T1 then falls
+/// back to file-level matching (the safe, pre-fix behavior).
+fn ts_import_bindings(w: &Walker, node: Node) -> Vec<String> {
+    let mut bindings = Vec::new();
+    for child in each_child(node) {
+        match child.kind() {
+            // Named imports: `import { greet, farewell as f } from "./a"`
+            "import_clause" => {
+                for sub in each_child(child) {
+                    match sub.kind() {
+                        "named_imports" => {
+                            for spec in each_child(sub) {
+                                if spec.kind() == "import_specifier"
+                                    && let Some(name) = sub_field_text(w, spec, "name")
+                                {
+                                    bindings.push(name);
+                                }
+                            }
+                        }
+                        // Default import: `import greet from "./a"`
+                        "identifier" => {
+                            let name = w.text(sub);
+                            if !name.is_empty() {
+                                bindings.push(name);
+                            }
+                        }
+                        // Wildcard: `import * as ns` — no tracked bindings.
+                        "namespace_import" | "import_namespace_clause" => {
+                            return Vec::new();
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            // Re-export: `export { greet } from "./a"`
+            "export_clause" => {
+                for spec in each_child(child) {
+                    if spec.kind() == "export_specifier"
+                        && let Some(name) = sub_field_text(w, spec, "name")
+                    {
+                        bindings.push(name);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    bindings
+}
+
+fn sub_field_text(w: &Walker, node: Node, field: &str) -> Option<String> {
+    let child = node.child_by_field_name(field)?;
+    let text = w.text(child);
+    if text.is_empty() { None } else { Some(text) }
+}
+
 // --- Rust ----------------------------------------------------------------
 
 fn walk_rust(w: &mut Walker, node: Node, depth: usize) {
     if depth > MAX_DEPTH {
+        return;
+    }
+    if rust_is_test_container(w, node) {
         return;
     }
     let mut pushed = false;
@@ -378,7 +453,7 @@ fn walk_rust(w: &mut Walker, node: Node, depth: usize) {
         "use_declaration" => {
             if let Some(arg) = node.child_by_field_name("argument") {
                 let spec = w.text(arg);
-                w.push_import(spec);
+                w.push_import(spec, Vec::new());
             }
         }
         _ => {}
@@ -389,6 +464,30 @@ fn walk_rust(w: &mut Walker, node: Node, depth: usize) {
     if pushed {
         w.stack.pop();
     }
+}
+
+fn rust_is_test_container(w: &Walker, node: Node) -> bool {
+    if !matches!(node.kind(), "function_item" | "mod_item") {
+        return false;
+    }
+    let range = node.byte_range();
+    let end = range.end.min(range.start.saturating_add(512));
+    let prefix = String::from_utf8_lossy(&w.src[range.start..end]);
+    let header = prefix.split('{').next().unwrap_or(&prefix);
+    let mut attributes = String::new();
+    let mut sibling = node.prev_named_sibling();
+    while let Some(previous) = sibling {
+        if previous.kind() != "attribute_item" {
+            break;
+        }
+        attributes.push_str(&w.text(previous));
+        sibling = previous.prev_named_sibling();
+    }
+    let markers = format!("{attributes}{header}");
+    markers.contains("#[test]")
+        || markers.contains("::test]")
+        || markers.contains("::test(")
+        || (node.kind() == "mod_item" && markers.contains("#[cfg(test)]"))
 }
 
 fn rust_callee(w: &mut Walker, call: Node, f: Node) {
@@ -444,9 +543,10 @@ fn walk_go(w: &mut Walker, node: Node, depth: usize) {
             }
         }
         "type_spec" => {
-            if let (Some(name), Some(ty)) =
-                (field_text(w, node, "name"), node.child_by_field_name("type"))
-            {
+            if let (Some(name), Some(ty)) = (
+                field_text(w, node, "name"),
+                node.child_by_field_name("type"),
+            ) {
                 match ty.kind() {
                     "struct_type" => w.push_symbol(name.clone(), name, SymbolKind::Struct, node),
                     "interface_type" => {
@@ -476,7 +576,7 @@ fn walk_go(w: &mut Walker, node: Node, depth: usize) {
         "import_spec" => {
             if let Some(path) = node.child_by_field_name("path") {
                 let spec = strip_quotes(&w.text(path));
-                w.push_import(spec);
+                w.push_import(spec, Vec::new());
             }
         }
         _ => {}
@@ -560,7 +660,7 @@ fn walk_java(w: &mut Walker, node: Node, depth: usize) {
             if star && !spec.is_empty() {
                 spec.push_str(".*");
             }
-            w.push_import(spec);
+            w.push_import(spec, Vec::new());
         }
         _ => {}
     }
@@ -620,12 +720,12 @@ fn walk_python(w: &mut Walker, node: Node, depth: usize) {
                 match child.kind() {
                     "dotted_name" => {
                         let spec = w.text(child);
-                        w.push_import(spec);
+                        w.push_import(spec, Vec::new());
                     }
                     "aliased_import" => {
                         if let Some(name) = child.child_by_field_name("name") {
                             let spec = w.text(name);
-                            w.push_import(spec);
+                            w.push_import(spec, Vec::new());
                         }
                     }
                     _ => {}
@@ -635,7 +735,7 @@ fn walk_python(w: &mut Walker, node: Node, depth: usize) {
         "import_from_statement" => {
             if let Some(m) = node.child_by_field_name("module_name") {
                 let spec = w.text(m);
-                w.push_import(spec);
+                w.push_import(spec, Vec::new());
             }
         }
         _ => {}
@@ -645,5 +745,38 @@ fn walk_python(w: &mut Walker, node: Node, depth: usize) {
     }
     if pushed {
         w.stack.pop();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::extract_file;
+
+    #[test]
+    fn rust_test_containers_do_not_enter_runtime_graph() {
+        let source = br#"
+fn production_entry() { production_helper(); }
+fn production_helper() {}
+
+#[test]
+fn top_level_test() { production_entry(); }
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn nested_test() { super::production_entry(); }
+}
+"#;
+        let extraction = extract_file("src/lib.rs", source).unwrap();
+        let names: Vec<_> = extraction
+            .symbols
+            .iter()
+            .map(|symbol| symbol.name.as_str())
+            .collect();
+        assert!(names.contains(&"production_entry"));
+        assert!(names.contains(&"production_helper"));
+        assert!(!names.contains(&"top_level_test"));
+        assert!(!names.contains(&"nested_test"));
+        assert!(!names.contains(&"tests"));
     }
 }

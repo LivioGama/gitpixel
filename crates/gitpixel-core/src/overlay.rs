@@ -9,6 +9,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use crate::gram::GramExtractor;
+use crate::index::{MAX_FILE_BYTES, read_regular_bounded};
 use crate::posting::GramQuery;
 
 #[derive(Default)]
@@ -24,12 +25,13 @@ impl Overlay {
         Self::default()
     }
 
-    /// Re-extract one file from disk. Missing or binary files are tombstoned
-    /// without an overlay gram set (they can never match).
+    /// Re-extract one file from disk. Missing, binary, or symlinked files are
+    /// tombstoned without an overlay gram set (they can never match). Symlinks
+    /// are rejected so a tracked symlink can never expose out-of-repo content.
     pub fn refresh_file(&mut self, root: &Path, rel_path: &str, extractor: &dyn GramExtractor) {
         self.tombstones.insert(rel_path.to_string());
         let abs = root.join(rel_path);
-        let Ok(content) = std::fs::read(&abs) else {
+        let Ok(content) = read_regular_bounded(&abs, MAX_FILE_BYTES) else {
             self.files.remove(rel_path);
             return;
         };

@@ -75,7 +75,11 @@ impl<W: Weigher> SparseGramExtractor<W> {
         assert!(min_len >= 3, "min gram length must be >= 3");
         assert!(max_len >= min_len);
         assert!(max_len <= u16::MAX as usize);
-        Self { weigher, min_len, max_len }
+        Self {
+            weigher,
+            min_len,
+            max_len,
+        }
     }
 
     #[inline]
@@ -143,13 +147,14 @@ impl<W: Weigher> GramExtractor for SparseGramExtractor<W> {
             // The nearest surviving left end strictly dominates everything
             // between it and `right` (all of that was just popped or is
             // lighter), so it pairs with `right` as well.
-            if allow_survivor_pair {
-                if let Some(top) = hull.back() {
-                    self.emit(text, top.left, right, out);
-                }
+            if allow_survivor_pair && let Some(top) = hull.back() {
+                self.emit(text, top.left, right, out);
             }
 
-            hull.push_back(HullEntry { left: right, weight });
+            hull.push_back(HullEntry {
+                left: right,
+                weight,
+            });
         }
     }
 
@@ -167,8 +172,7 @@ impl<W: Weigher> GramExtractor for SparseGramExtractor<W> {
         let mut kept: Vec<GramHit> = Vec::new();
         for h in hits {
             let contained = kept.iter().any(|k| {
-                k.start <= h.start
-                    && u32::from(k.len) + k.start >= u32::from(h.len) + h.start
+                k.start <= h.start && u32::from(k.len) + k.start >= u32::from(h.len) + h.start
             });
             if !contained {
                 kept.push(h);
@@ -181,7 +185,12 @@ impl<W: Weigher> GramExtractor for SparseGramExtractor<W> {
     }
 
     fn id(&self) -> String {
-        format!("sparse-{}-{}-{}", self.weigher.id(), self.min_len, self.max_len)
+        format!(
+            "sparse-{}-{}-{}",
+            self.weigher.id(),
+            self.min_len,
+            self.max_len
+        )
     }
 }
 
@@ -231,11 +240,7 @@ mod tests {
     }
 
     /// O(n^3) oracle implementing the predicate literally.
-    fn brute_force(
-        text: &[u8],
-        min_len: usize,
-        max_len: usize,
-    ) -> HashSet<(u32, u16)> {
+    fn brute_force(text: &[u8], min_len: usize, max_len: usize) -> HashSet<(u32, u16)> {
         let w = min_len - 1;
         let mut set = HashSet::new();
         if text.len() < min_len {
@@ -253,9 +258,7 @@ mod tests {
                     break;
                 }
                 let interior = &weights[i + 1..j];
-                let dominated = interior
-                    .iter()
-                    .all(|&m| weights[i] > m && weights[j] > m);
+                let dominated = interior.iter().all(|&m| weights[i] > m && weights[j] > m);
                 if dominated {
                     set.insert((i as u32, len as u16));
                 }

@@ -1,4 +1,10 @@
-# Phase 1 exit record — indexer, shards, query path, BENCHMARK GATE
+# Phase 1 exploratory record — indexer, shards, query path
+
+> Historical development observations only. Trial counts, raw samples,
+> confidence intervals, commit SHAs, subprocess counts, agent-facing
+> operations, and token measurements were not recorded. These numbers must
+> not be used as a current performance claim or as evidence that gitpixel is
+> faster than ripgrep or GitNexus.
 
 Machine: Apple Silicon macOS (Darwin 27.0.0), rustc 1.96.0, release build.
 Corpora: real repos on this machine.
@@ -59,18 +65,15 @@ line-level diff after sort: **zero missed, zero extra** on all 4 queries
 
 omni-dev-624 (594 MB tree), trigram index:
 
-| Query | gitpixel | ripgrep 15.2.0 | speedup |
-|---|---|---|---|
-| `PocketBase` | 20.6 ms | 168.0 ms | 8.2× |
-| `useEffect` | 9.5 ms | 118.9 ms | 12.5× |
-| `const` (pathological) | 82.5 ms | 102.5 ms | 1.2× |
-| `export const [A-Z][a-zA-Z]+` | 20.3 ms | 92.5 ms | 4.6× |
+The original run observed lower wall-clock times for gitpixel on four local
+queries, but the retained record is insufficient to reproduce or validate
+that comparison. The numerical table is intentionally removed until a pinned
+paired harness emits the required raw artifacts.
 
 gitpixel cold includes process spawn + shard mmap + plan + posting resolve +
 regex verification of candidates. rg must walk the tree every time; the
 index amortizes that. The daemon (Phase 2) removes the remaining process
 spawn + mmap cost from the warm path.
 
-High σ on some rows (page-cache sensitivity); numbers are means over
-hyperfine's default runs. Re-run: `scripts/` gains a pinned harness in
-Phase 2 when the freshness loop lands.
+High variance was observed from page-cache sensitivity. No rerun command or
+raw trial artifact was retained, so this section records design history only.
