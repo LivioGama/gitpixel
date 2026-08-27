@@ -21,6 +21,8 @@ A Rust sidecar that replaces grep-style scanning and stale code-graph tools with
 
 ⚡ **Serving** — One core `Service`; CLI one-shot commands that transparently use a warm Unix-socket daemon (NDJSON protocol, fs watcher, idle timeout) when available. MCP is a planned thin adapter over the same `Service`.
 
+🎯 **Error sniper** — One-look error capture: a per-repository SQLite sink (WAL, dedup with repeat counters, retention) that collects runtime, HTTP-5xx, build, and test failures at throw-time with source-mapped frames, package provenance (duplicate-copy detection), run fingerprints, and HMR/lifecycle events. Queried in one call via `gitpixel sniper` or its stdio MCP server (`rmcp`); fed by `gitpixel sniper run -- <cmd>` (tsc-aware) and the `@gitpixel/sniper` JS companion in `js/sniper` (Vite dev plugin, browser client, vitest reporter).
+
 ## 🔧 Installation
 
 ### From source (release build)
@@ -41,7 +43,10 @@ cargo build --release
 | `gitpixel-context` | Token-budgeted context assembly |
 | `gitpixel-serve` | `Service`, daemon, NDJSON API |
 | `gitpixel-cli` | `gitpixel` binary — every command surface |
+| `gitpixel-sniper` | Error sink: store, dedup, query layer, run wrapper, MCP server |
 | `gitpixel-bench` | Criterion benchmarks (see `docs/bench/`) |
+
+The `js/sniper` directory holds `@gitpixel/sniper`, the JS companion feeding the sniper sink from Vite dev servers, browsers, and vitest.
 
 ## 🚀 Quick Start
 
@@ -150,6 +155,34 @@ the warm daemon. Pass `--no-daemon` when only preparing index artifacts.
 target/release/gitpixel ready /path/to/repo
 target/release/gitpixel ready /path/to/repo --no-daemon --json
 ```
+
+### Error sniper
+
+```bash
+# Wrap any command; failures land in the sink as structured records
+target/release/gitpixel sniper run --label typecheck -- bunx tsc --noEmit --pretty false
+# → #1 [tsc] TS2322: Type 'string' is not assignable…  #3 [tsc] summary: 3 errors in 1 file
+
+# Newest errors, one line each, with a cursor footer
+target/release/gitpixel sniper last
+# → #412  2s ago  ×3  [browser-rejection] TypeError: undefined is not an object (evaluating 'api.sessions.x')
+#         @ src/routes/chat.tsx:88:14  ← via @tanstack/react-router@1.130.2  [!] 2 physical copies
+#   cursor: 412
+
+# The agent loop: anything new since my last check?
+target/release/gitpixel sniper since 412
+
+# Full detail: mapped frames, provenance, values, run fingerprint diff, ±30s events
+target/release/gitpixel sniper show 412
+
+# "Was my edit applied?" — HMR/reload/dep-optimization events
+target/release/gitpixel sniper hmr --file src/routes/chat.tsx
+
+# Stdio MCP server (tools: errors_since, error_show, errors_query, hmr_status, env_fingerprint)
+target/release/gitpixel sniper mcp
+```
+
+Vite apps adopt capture in two lines with the JS companion — see [js/sniper/README.md](js/sniper/README.md).
 
 ## 🎨 Design Notes
 
