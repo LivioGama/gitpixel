@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/gitpixel-core", "crates/gitpixel-cli", "crates/gitpixel-graph", "crates/gitpixel-context", "crates/gitpixel-serve", "crates/gitpixel-bench"]
+members = ["crates/gitpixel-core", "crates/gitpixel-cli", "crates/gitpixel-graph", "crates/gitpixel-context", "crates/gitpixel-serve", "crates/gitpixel-bench", "crates/gitpixel-sniper"]
 
 [workspace.package]
 edition = "2024"

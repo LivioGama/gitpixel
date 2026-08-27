@@ -9,6 +9,8 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use clap::{Parser, Subcommand, ValueEnum};
+
+mod sniper_cmd;
 use gitpixel_core::index::{build, shard_path};
 use gitpixel_core::shard::Shard;
 use gitpixel_core::{Crc32Weigher, GramExtractor, SparseGramExtractor, TrigramExtractor};
@@ -195,6 +197,11 @@ enum Command {
     Daemon {
         #[command(subcommand)]
         cmd: DaemonCmd,
+    },
+    /// One-look error capture: query the sniper error sink (CLI + MCP).
+    Sniper {
+        #[command(subcommand)]
+        cmd: sniper_cmd::SniperCmd,
     },
 }
 
@@ -993,6 +1000,7 @@ fn run() -> Result<(), String> {
             DaemonCmd::Stop { path } => daemon_stop(discover_root(&path)?),
             DaemonCmd::Status { path } => daemon_status(discover_root(&path)?),
         },
+        Command::Sniper { cmd } => sniper_cmd::run_sniper(cmd),
     }
 }
 
