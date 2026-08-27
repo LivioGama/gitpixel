@@ -18,8 +18,10 @@ pub mod imports;
 pub mod process;
 pub mod resolve;
 pub mod store;
+pub mod targets;
 pub mod trace;
 
+pub use impact::split_ident_words;
 pub use store::{
     EdgeKind, EdgeRow, Envelope, FileRow, GraphStore, StoreError, SymbolKind, SymbolRow, Tier,
 };

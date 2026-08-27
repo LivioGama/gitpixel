@@ -506,6 +506,33 @@ impl IndexSet {
         Ok((matches, stats))
     }
 
+    /// All live file paths across base ∪ delta − tombstones + overlay,
+    /// sorted ascending — the canonical fresh file universe.
+    pub fn paths(&self) -> Vec<String> {
+        let mut paths: BTreeSet<String> = BTreeSet::new();
+        for id in 0..self.base.file_count() {
+            if let Some(p) = self.base.path_of(id)
+                && !self.delta_tombstones.contains(p)
+                && !self.overlay.tombstones.contains(p)
+            {
+                paths.insert(p.to_string());
+            }
+        }
+        if let Some(delta) = &self.delta {
+            for id in 0..delta.file_count() {
+                if let Some(p) = delta.path_of(id)
+                    && !self.overlay.tombstones.contains(p)
+                {
+                    paths.insert(p.to_string());
+                }
+            }
+        }
+        for p in self.overlay.files.keys() {
+            paths.insert(p.clone());
+        }
+        paths.into_iter().collect()
+    }
+
     pub fn status(&self) -> FreshnessStatus {
         FreshnessStatus {
             commit_oid: self.base.commit_oid().map(str::to_string),
@@ -591,6 +618,36 @@ mod tests {
         set.remove_file("gamma.rs");
         let (m, _) = set.search("freshDeltaSymbol", None).unwrap();
         assert!(m.is_empty());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn paths_merges_layers_and_honors_tombstones() {
+        let dir = std::env::temp_dir().join(format!("gpx-indexset-paths-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        git(&dir, &["init", "-q"]);
+        std::fs::write(dir.join("alpha.rs"), "fn alpha() {}\n").unwrap();
+        std::fs::write(dir.join("beta.rs"), "fn beta() {}\n").unwrap();
+        git(&dir, &["add", "."]);
+        git(&dir, &["commit", "-qm", "one"]);
+
+        let mut set = IndexSet::open_or_build(&dir, ex()).unwrap();
+        assert_eq!(
+            set.paths(),
+            vec!["alpha.rs".to_string(), "beta.rs".to_string()]
+        );
+
+        // Overlay add is included; overlay delete is tombstoned out.
+        std::fs::write(dir.join("gamma.rs"), "fn gamma() {}\n").unwrap();
+        set.refresh_file("gamma.rs");
+        std::fs::remove_file(dir.join("beta.rs")).unwrap();
+        set.remove_file("beta.rs");
+        assert_eq!(
+            set.paths(),
+            vec!["alpha.rs".to_string(), "gamma.rs".to_string()]
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }

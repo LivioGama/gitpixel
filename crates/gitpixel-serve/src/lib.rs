@@ -4,6 +4,7 @@
 pub mod api;
 pub mod daemon;
 pub mod recall_service;
+pub mod targets;
 
 pub use api::{Request, Response, ServeError, Service};
 pub use daemon::{pid_path, run, socket_path};

@@ -11,6 +11,7 @@ use std::time::Duration;
 use clap::{Parser, Subcommand, ValueEnum};
 
 mod recall_cmd;
+mod rescue_cmd;
 mod sniper_cmd;
 use gitpixel_core::index::{build, shard_path};
 use gitpixel_core::shard::Shard;
@@ -83,6 +84,57 @@ enum Command {
         /// Skip the daemon even if one is running.
         #[arg(long)]
         no_daemon: bool,
+    },
+    /// Sniper target list: task description in, closed prioritized file list
+    /// out (P0 = start here, P1 = likely, P2 = droppable). Writes the
+    /// enforcement manifest .gitpixel/targets.json unless --no-manifest.
+    Targets {
+        /// Task/feature description (omit with --clear).
+        task: Option<String>,
+        #[arg(default_value = ".")]
+        path: PathBuf,
+        #[arg(long)]
+        json: bool,
+        /// Maximum files in the closed list (default 20, max 100).
+        #[arg(long)]
+        limit: Option<usize>,
+        /// Skip writing the enforcement manifest.
+        #[arg(long)]
+        no_manifest: bool,
+        /// Deactivate scoping: delete .gitpixel/targets.json and exit.
+        #[arg(long)]
+        clear: bool,
+    },
+    /// Surgical revert planner: locate the files a problem points at, list
+    /// recent versions with the likely-breaking commit flagged, recommend a
+    /// last-known-good candidate. Plan only — nothing is written without
+    /// --apply. Never resets; never touches the index or HEAD.
+    Rescue {
+        /// Problem description ("login was working before ...").
+        problem: Option<String>,
+        #[arg(default_value = ".")]
+        path: PathBuf,
+        /// Explicit target file(s), repo-relative; skips target discovery.
+        #[arg(long = "file")]
+        files: Vec<String>,
+        /// Commits of per-file history to inspect.
+        #[arg(long, default_value_t = 10)]
+        depth: usize,
+        /// Restore the --file targets to this commit (gated action).
+        #[arg(long)]
+        apply: Option<String>,
+        /// With --apply on dirty files: deterministic 3-way merge that keeps
+        /// in-progress edits (may leave conflict markers).
+        #[arg(long)]
+        merge: bool,
+        /// With --apply: `git stash push` the dirty planned files first.
+        #[arg(long)]
+        stash_first: bool,
+        /// With --apply: overwrite dirty files (loses in-progress work).
+        #[arg(long)]
+        allow_dirty: bool,
+        #[arg(long)]
+        json: bool,
     },
     /// Look up symbols by name in the code graph.
     Symbol {
@@ -366,6 +418,101 @@ fn symbol_line(s: &Value) -> String {
     )
 }
 
+/// Tiered pretty rendering for `targets`.
+fn pretty_targets(d: &Value) -> Option<String> {
+    let targets = d.get("targets")?.as_array()?;
+    let mut output = String::new();
+    for (tier, title) in [
+        ("P0", "P0 — primary (start here)"),
+        ("P1", "P1 — likely needed"),
+        ("P2", "P2 — peripheral (droppable)"),
+    ] {
+        let group: Vec<&Value> = targets.iter().filter(|t| t["tier"] == tier).collect();
+        if group.is_empty() {
+            continue;
+        }
+        output.push_str(title);
+        output.push('\n');
+        for t in group {
+            output.push_str(&format!(
+                "  {:<50} {:.6}\n",
+                t.get("path").and_then(Value::as_str).unwrap_or("?"),
+                t.get("score").and_then(Value::as_f64).unwrap_or(0.0),
+            ));
+            if let Some(reasons) = t.get("reasons").and_then(Value::as_array) {
+                for r in reasons {
+                    output.push_str(&format!("      {}\n", r.as_str().unwrap_or("")));
+                }
+            }
+        }
+    }
+    let limit = d
+        .get("stats")
+        .and_then(|s| s.get("limit"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    output.push_str(&format!(
+        "closed list: {} files (limit {limit})\n",
+        targets.len()
+    ));
+    if let Some(cw) = d.get("closed_world").and_then(Value::as_str) {
+        output.push_str(cw);
+        output.push('\n');
+    }
+    envelope_note(d);
+    Some(output)
+}
+
+/// Write the enforcement manifest atomically (tmp + rename).
+fn write_targets_manifest(manifest_path: &Path, task: &str, data: &Value) -> Result<(), String> {
+    let files: Vec<Value> = data
+        .get("targets")
+        .and_then(Value::as_array)
+        .map(|ts| {
+            ts.iter()
+                .map(|t| {
+                    serde_json::json!({
+                        "path": t.get("path").cloned().unwrap_or(Value::Null),
+                        "tier": t.get("tier").cloned().unwrap_or(Value::Null),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let created_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let manifest = serde_json::json!({
+        "version": 1,
+        "task": task,
+        "created_unix": created_unix,
+        "head_oid": data
+            .get("stats")
+            .and_then(|s| s.get("commit_oid"))
+            .cloned()
+            .unwrap_or(Value::Null),
+        "limit": data
+            .get("stats")
+            .and_then(|s| s.get("limit"))
+            .cloned()
+            .unwrap_or(Value::Null),
+        "files": files,
+    });
+    if let Some(parent) = manifest_path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("create {}: {e}", parent.display()))?;
+    }
+    let tmp = manifest_path.with_extension("json.tmp");
+    std::fs::write(
+        &tmp,
+        serde_json::to_vec_pretty(&manifest).unwrap_or_default(),
+    )
+    .map_err(|e| format!("write {}: {e}", tmp.display()))?;
+    std::fs::rename(&tmp, manifest_path)
+        .map_err(|e| format!("publish {}: {e}", manifest_path.display()))?;
+    Ok(())
+}
+
 fn envelope_note(data: &Value) {
     if let Some(env) = data.get("envelope")
         && env
@@ -394,7 +541,9 @@ fn discover_root(path: &Path) -> Result<PathBuf, String> {
         .canonicalize()
         .map_err(|e| format!("bad path {}: {e}", path.display()))?;
     let start = if abs.is_file() {
-        abs.parent().map(Path::to_path_buf).unwrap_or_else(|| abs.clone())
+        abs.parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| abs.clone())
     } else {
         abs.clone()
     };
@@ -744,6 +893,203 @@ fn run() -> Result<(), String> {
             offset,
             no_daemon,
         } => run_search(pattern, paths, json, stats, limit, offset, no_daemon),
+        Command::Targets {
+            task,
+            path,
+            json,
+            limit,
+            no_manifest,
+            clear,
+        } => {
+            if clear {
+                // With --clear the sole positional (if any) is a path, not a
+                // task: `gitpixel targets --clear .` must just work.
+                let clear_path = match task {
+                    Some(t) => {
+                        let p = PathBuf::from(&t);
+                        if p.exists() {
+                            p
+                        } else {
+                            return Err("--clear takes no task argument".to_string());
+                        }
+                    }
+                    None => path,
+                };
+                let root = discover_root(&clear_path)?;
+                let manifest_path = root
+                    .join(gitpixel_core::index::SHARD_DIR)
+                    .join("targets.json");
+                if manifest_path.exists() {
+                    std::fs::remove_file(&manifest_path)
+                        .map_err(|e| format!("remove {}: {e}", manifest_path.display()))?;
+                    println!("targets manifest cleared");
+                } else {
+                    println!("no active targets manifest");
+                }
+                return Ok(());
+            }
+            let task =
+                task.ok_or_else(|| "missing task description (or pass --clear)".to_string())?;
+            let root = discover_root(&path)?;
+            let manifest_path = root
+                .join(gitpixel_core::index::SHARD_DIR)
+                .join("targets.json");
+            let data = execute(
+                &path,
+                Request::Targets {
+                    task: task.clone(),
+                    limit,
+                },
+                false,
+            )?;
+            if !no_manifest {
+                write_targets_manifest(&manifest_path, &task, &data)?;
+            }
+            finish_graph_cmd(data, json, pretty_targets)?;
+            if !no_manifest {
+                eprintln!(
+                    "targets manifest active: {} — scoping enforced; run `gitpixel targets --clear` when the task ends",
+                    manifest_path.display()
+                );
+            }
+            Ok(())
+        }
+        Command::Rescue {
+            problem,
+            path,
+            files,
+            depth,
+            apply,
+            merge,
+            stash_first,
+            allow_dirty,
+            json,
+        } => {
+            let root = discover_root(&path)?;
+            if let Some(oid) = apply {
+                let result = rescue_cmd::apply(
+                    &root,
+                    &oid,
+                    &files,
+                    &rescue_cmd::ApplyOptions {
+                        merge,
+                        stash_first,
+                        allow_dirty,
+                    },
+                )?;
+                if json {
+                    return print_data(&result, true);
+                }
+                if let Some(applied) = result["files"].as_array() {
+                    for f in applied {
+                        println!(
+                            "{}: {}{}",
+                            f["path"].as_str().unwrap_or("?"),
+                            f["action"].as_str().unwrap_or("?"),
+                            f["conflicts"]
+                                .as_i64()
+                                .filter(|c| *c > 0)
+                                .map(|c| format!(" ({c} conflict hunk(s) — resolve the markers)"))
+                                .unwrap_or_default(),
+                        );
+                    }
+                }
+                println!("{}", result["note"].as_str().unwrap_or(""));
+                return Ok(());
+            }
+            let problem = problem.ok_or_else(|| "missing problem description".to_string())?;
+            // Locate targets: explicit --file hints win; otherwise the sniper
+            // target engine points the problem at files (P0 slice).
+            let (target_paths, keywords) = if files.is_empty() {
+                let data = execute(
+                    &path,
+                    Request::Targets {
+                        task: problem.clone(),
+                        limit: Some(10),
+                    },
+                    false,
+                )?;
+                let all = data["targets"].as_array().cloned().unwrap_or_default();
+                let mut paths: Vec<String> = all
+                    .iter()
+                    .filter(|t| t["tier"] == "P0")
+                    .filter_map(|t| t["path"].as_str().map(str::to_string))
+                    .take(5)
+                    .collect();
+                if paths.is_empty() {
+                    paths = all
+                        .iter()
+                        .filter_map(|t| t["path"].as_str().map(str::to_string))
+                        .take(5)
+                        .collect();
+                }
+                let kws: Vec<String> = data["keywords"]
+                    .as_array()
+                    .map(|ks| {
+                        ks.iter()
+                            .filter_map(|k| k.as_str().map(str::to_string))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                (paths, kws)
+            } else {
+                let q = gitpixel_serve::targets::tokenize_task(&problem).unwrap_or_default();
+                (files.clone(), q.keywords)
+            };
+            if target_paths.is_empty() {
+                return Err(
+                    "could not locate target files for this problem — pass --file <path>"
+                        .to_string(),
+                );
+            }
+            let plan = rescue_cmd::plan(&root, &problem, &target_paths, &keywords, depth)?;
+            if json {
+                return print_data(&plan, true);
+            }
+            for t in plan["targets"].as_array().cloned().unwrap_or_default() {
+                println!(
+                    "{}{}",
+                    t["path"].as_str().unwrap_or("?"),
+                    if t["dirty"].as_bool().unwrap_or(false) {
+                        "  [DIRTY — has uncommitted changes]"
+                    } else {
+                        ""
+                    }
+                );
+                for v in t["versions"].as_array().cloned().unwrap_or_default() {
+                    println!(
+                        "  {}  {}{}",
+                        v["short"].as_str().unwrap_or("?"),
+                        v["subject"].as_str().unwrap_or(""),
+                        if v["suspect"].as_bool().unwrap_or(false) {
+                            "  [SUSPECT]"
+                        } else {
+                            ""
+                        }
+                    );
+                }
+                if let Some(rec) = t["recommended"].as_object() {
+                    println!(
+                        "  → recommended: {} ({})",
+                        rec.get("oid").and_then(Value::as_str).unwrap_or("?"),
+                        rec.get("reason").and_then(Value::as_str).unwrap_or(""),
+                    );
+                }
+                println!();
+            }
+            for c in plan["decision"]["caveats"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+            {
+                eprintln!("⚠ {}", c.as_str().unwrap_or(""));
+            }
+            if let Some(cmd) = plan["decision"]["options"][0]["command"].as_str() {
+                println!("revert: {cmd}");
+            }
+            println!("fix forward: keep current code and fix the bug in place");
+            Ok(())
+        }
         Command::Symbol { name, path, json } => {
             let data = execute(&path, Request::Symbol { name }, false)?;
             finish_graph_cmd(data, json, |d| {
@@ -1002,7 +1348,9 @@ fn run() -> Result<(), String> {
             Ok(())
         }
         Command::Daemon { cmd } => match cmd {
-            DaemonCmd::Start { path, foreground } => daemon_start(discover_root(&path)?, foreground),
+            DaemonCmd::Start { path, foreground } => {
+                daemon_start(discover_root(&path)?, foreground)
+            }
             DaemonCmd::Stop { path } => daemon_stop(discover_root(&path)?),
             DaemonCmd::Status { path } => daemon_status(discover_root(&path)?),
         },

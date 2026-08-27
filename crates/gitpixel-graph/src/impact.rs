@@ -250,7 +250,7 @@ pub fn impact(
 
 /// Word-frequency helper shared by cluster/process labeling: split camelCase +
 /// snake_case identifiers into lowercase words.
-pub(crate) fn split_ident_words(name: &str) -> Vec<String> {
+pub fn split_ident_words(name: &str) -> Vec<String> {
     let mut words = Vec::new();
     for chunk in name.split(['_', '-', '.', ':', '#']) {
         if chunk.is_empty() {

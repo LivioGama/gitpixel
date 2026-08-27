@@ -164,6 +164,82 @@ target/release/gitpixel ready /path/to/repo
 target/release/gitpixel ready /path/to/repo --no-daemon --json
 ```
 
+### Sniper targets — task scoping
+
+Task description in, closed prioritized file list out. The list is the
+agent's whole world for that task: P0 = start here (guaranteed relevant),
+P1 = likely needed, P2 = peripheral and droppable. Lexical (filename,
+symbol-name, content) and graph (callers/callees, imports, clusters)
+signals fused with reciprocal-rank fusion; deterministic; ~20 ms against a
+warm daemon.
+
+```bash
+# Scope a task: emits the tiered list AND activates .gitpixel/targets.json
+gitpixel targets "fix rate limiting on the upload endpoint" /path/to/repo
+# → P0 — primary (start here)
+#     src/api/upload.ts        0.0921   filename match: upload · defines symbol `uploadHandler`
+#   P1 — likely needed …  P2 — peripheral (droppable) …
+#   closed list: 12 files (limit 20)
+
+gitpixel targets "…" . --json --limit 30     # machine output, wider list
+gitpixel targets "…" . --no-manifest         # dry run, no enforcement manifest
+gitpixel targets --clear .                   # end scoping (delete the manifest)
+```
+
+The manifest (`{task, created_unix, head_oid, files:[{path,tier}]}`) is what
+harness hooks enforce against; it goes stale automatically after 24 h.
+Every report carries the epistemic envelope: `lower_bound: true` means the
+graph could not close the world (unresolved same-name call sites, or
+lexical-only mode) — unlisted files may then be involved.
+
+### Rescue — surgical revert planner
+
+"It was working before" is a retrieval problem, not a coding problem.
+`rescue` locates the files a problem points at (same target engine), lists
+each file's recent versions with the likely-breaking commit flagged, and
+recommends a last-known-good candidate. **Plan only by default** — nothing
+is written without `--apply`, and apply never touches the index or HEAD,
+never `reset --hard`s, and never overwrites uncommitted work without an
+explicit strategy.
+
+```bash
+# Plan: versions per target file + recommended last-good + decision block
+gitpixel rescue "upload progress bar was working before" . [--json]
+# → src/upload/progress.ts
+#     a1b2c3d  rework upload pipeline   [SUSPECT]
+#     e4f5a6b  add progress bar
+#     → recommended: e4f5a6b (last version before suspect commit a1b2c3d)
+#   revert: gitpixel rescue --apply e4f5a6b --file src/upload/progress.ts .
+#   fix forward: keep current code and fix the bug in place
+
+# Gated apply — working tree only, ordinary undoable diff
+gitpixel rescue --apply e4f5a6b --file src/upload/progress.ts .
+# Dirty file strategies (refused by default):
+#   --merge       deterministic 3-way merge; keeps in-progress edits (may leave markers)
+#   --stash-first `git stash push` the planned files before writing
+#   --allow-dirty overwrite (loses in-progress work — explicit opt-in)
+```
+
+### Agent workflow contract
+
+Paste into the adopting repo's `CLAUDE.md` / `AGENTS.md`:
+
+> Before the first file read of any feature/bug task, run
+> `gitpixel targets "<task>"`. It returns a closed prioritized file list
+> (P0/P1/P2) and activates `.gitpixel/targets.json`. Work P0 first; P2 is
+> droppable. While the manifest is active, never read, grep, or edit repo
+> files outside the list — if a file seems missing, the task description was
+> wrong: re-run `gitpixel targets` with a refined task. Run
+> `gitpixel targets --clear` when the task ends.
+> When the user says something **was working before** (or the fix is in git
+> history), run `gitpixel rescue "<problem>"` — never `git reset --hard`,
+> never raw historical checkouts over in-progress work.
+
+Claude Code additionally enforces all of this mechanically via the
+`gitpixel-targets-guard` PreToolUse hook (off-list reads/edits blocked,
+edits without an active manifest blocked, `git reset --hard` blocked).
+Kill switch for debugging the guard: `GITPIXEL_TARGETS_GUARD=0`.
+
 ### Error sniper
 
 ```bash

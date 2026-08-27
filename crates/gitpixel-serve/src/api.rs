@@ -21,7 +21,7 @@ use gitpixel_graph::{EdgeKind, EdgeRow, GraphStore, SymbolKind, SymbolRow};
 pub const GRAPH_DB_FILE: &str = "graph.db";
 /// Increment whenever the daemon request/response contract changes in a way
 /// that an older process cannot safely serve to a newer CLI.
-pub const PROTOCOL_VERSION: u64 = 5;
+pub const PROTOCOL_VERSION: u64 = 6;
 
 // ---------------------------------------------------------------------------
 // errors
@@ -84,6 +84,13 @@ pub enum Request {
         /// multi-path invocations). None/empty = whole repo.
         #[serde(default)]
         paths: Option<Vec<String>>,
+    },
+    /// Sniper target list: task description in, closed prioritized file
+    /// list (P0/P1/P2) out.
+    Targets {
+        task: String,
+        #[serde(default)]
+        limit: Option<usize>,
     },
     Symbol {
         name: String,
@@ -292,6 +299,7 @@ impl Service {
                 offset,
                 paths,
             } => self.op_search(&pattern, limit, offset, paths.as_deref()),
+            Request::Targets { task, limit } => self.op_targets(&task, limit),
             Request::Symbol { name } => self.op_symbol(&name),
             Request::Context { uid, budget_tokens } => self.op_context(&uid, budget_tokens),
             Request::Impact {
@@ -391,6 +399,126 @@ impl Service {
                 "truncated": stats.truncated,
             }
         }))
+    }
+
+    /// Sniper target list: tokenize the task, gather lexical + graph signals,
+    /// fuse, tier. Graph failure degrades to lexical-only (envelope says so)
+    /// instead of erroring — a scoping request must never die on a broken
+    /// graph build.
+    fn op_targets(&mut self, task: &str, limit: Option<usize>) -> Result<Value, String> {
+        use crate::targets as engine;
+        use gitpixel_graph::targets as graph_targets;
+
+        let started = Instant::now();
+        let query = engine::tokenize_task(task)?;
+
+        let ensured = self.ensure_graph();
+        let graph_available = ensured.is_ok();
+        let build_info = ensured.ok().flatten();
+
+        let all_paths = self.index.paths();
+
+        // S3: per-keyword content match counts (capped probes keep this ms-scale).
+        const CONTENT_PROBE_LIMIT: usize = 500;
+        let mut content_hits: BTreeMap<String, Vec<(String, u32)>> = BTreeMap::new();
+        for kw in &query.keywords {
+            // Keywords are [a-z0-9_]+ by construction — safe inside a regex.
+            let pattern = format!("(?i){kw}");
+            if let Ok((matches, _)) =
+                self.index
+                    .search_page_in(&pattern, 0, Some(CONTENT_PROBE_LIMIT), None)
+            {
+                let mut counts: BTreeMap<String, u32> = BTreeMap::new();
+                for m in matches {
+                    *counts.entry(m.path).or_default() += 1;
+                }
+                if !counts.is_empty() {
+                    content_hits.insert(kw.clone(), counts.into_iter().collect());
+                }
+            }
+        }
+
+        let mut symbol_hits = Vec::new();
+        let mut graph_neighbors: Vec<(String, String)> = Vec::new();
+        let mut cluster_neighbors: Vec<(String, String)> = Vec::new();
+        let mut envelope = None;
+        if graph_available {
+            let store = self.graph.as_ref().unwrap();
+            symbol_hits = graph_targets::symbol_hits(store, &query.keywords, &query.exact_tokens)
+                .map_err(|e| e.to_string())?;
+
+            // Graph expansion is seeded from the lexical pre-fuse so every
+            // P1/P2 neighbor traces back to a lexical anchor.
+            const MAX_SEED_FILES: usize = 8;
+            const MAX_SEED_SYMBOLS: usize = 24;
+            let seed_paths: Vec<String> =
+                engine::lexical_rank(&all_paths, &query.keywords, &symbol_hits, &content_hits)
+                    .into_iter()
+                    .take(MAX_SEED_FILES)
+                    .collect();
+            let seed_set: HashSet<&str> = seed_paths.iter().map(String::as_str).collect();
+            let mut seed_symbol_ids: Vec<i64> = Vec::new();
+            for hit in &symbol_hits {
+                if seed_set.contains(hit.path.as_str()) {
+                    for (sym, _) in &hit.symbols {
+                        if seed_symbol_ids.len() < MAX_SEED_SYMBOLS {
+                            seed_symbol_ids.push(sym.id);
+                        }
+                    }
+                }
+            }
+
+            let mut seen: HashSet<String> = HashSet::new();
+            for (path, reason) in graph_targets::neighbor_files(store, &seed_symbol_ids)
+                .map_err(|e| e.to_string())?
+                .into_iter()
+                .chain(
+                    graph_targets::import_adjacent_files(store, &seed_paths)
+                        .map_err(|e| e.to_string())?,
+                )
+            {
+                if seen.insert(path.clone()) {
+                    graph_neighbors.push((path, reason));
+                }
+            }
+            cluster_neighbors =
+                graph_targets::cluster_co_files(store, &seed_symbol_ids, &query.keywords)
+                    .map_err(|e| e.to_string())?;
+
+            let mut names: Vec<&str> = query.exact_tokens.iter().map(String::as_str).collect();
+            for hit in &symbol_hits {
+                for (sym, _) in &hit.symbols {
+                    names.push(sym.name.as_str());
+                }
+            }
+            envelope =
+                Some(graph_targets::envelope_for_names(store, &names).map_err(|e| e.to_string())?);
+        }
+
+        let opts = engine::TargetsOptions {
+            limit: limit.unwrap_or(engine::DEFAULT_LIMIT),
+        };
+        let report = engine::compute_targets(
+            task,
+            &query,
+            engine::SignalInputs {
+                all_paths,
+                content_hits,
+                symbol_hits,
+                graph_neighbors,
+                cluster_neighbors,
+                graph_available,
+                envelope,
+            },
+            &opts,
+        );
+        let mut out = serde_json::to_value(&report).map_err(|e| e.to_string())?;
+        if let Some(stats) = out.get_mut("stats") {
+            stats["elapsed_ms"] = json!(started.elapsed().as_millis() as u64);
+            stats["commit_oid"] = json!(self.index.status().commit_oid);
+        }
+        merge_build_info(&mut out, build_info);
+        Ok(out)
     }
 
     fn op_symbol(&mut self, name: &str) -> Result<Value, String> {
