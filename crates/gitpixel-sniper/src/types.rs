@@ -14,6 +14,9 @@ pub enum Surface {
     ServerConsole,
     NodeUncaught,
     NodeUnhandled,
+    /// serde's kebab-case would render this as "http5xx"; the wire name is
+    /// "http-5xx" everywhere (as_str/parse and the JS adapters).
+    #[serde(rename = "http-5xx", alias = "http5xx")]
     Http5xx,
     ViteTransform,
     Vitest,
