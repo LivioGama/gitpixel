@@ -5,7 +5,9 @@
 pub mod dedup;
 pub mod format;
 pub mod mcp;
+pub mod parsers;
 pub mod query;
+pub mod run;
 pub mod store;
 pub mod types;
 

@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use clap::Subcommand;
 use gitpixel_sniper::store::{Store, now_ms, resolve_project_root};
 use gitpixel_sniper::types::{ReportEnvelope, Surface};
-use gitpixel_sniper::{format, mcp, query};
+use gitpixel_sniper::{format, mcp, query, run};
 
 #[derive(Subcommand)]
 pub enum SniperCmd {
@@ -111,6 +111,19 @@ pub enum SniperCmd {
     Mcp {
         #[arg(long, default_value = ".")]
         repo: PathBuf,
+    },
+    /// Wrap a command: tee its output live, mirror its exit code, and on
+    /// failure record structured errors (tsc parsed per TS code; otherwise a
+    /// generic tail record + full output in raw_fallbacks).
+    Run {
+        /// Name for the records (defaults to the command).
+        #[arg(long)]
+        label: Option<String>,
+        #[arg(long, default_value = ".")]
+        repo: PathBuf,
+        /// The command and its arguments (after --).
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
+        cmd: Vec<String>,
     },
 }
 
@@ -244,6 +257,12 @@ pub fn run_sniper(cmd: SniperCmd) -> Result<(), String> {
         SniperCmd::Mcp { repo } => {
             let store = open_store(&repo)?;
             mcp::run(store)
+        }
+        SniperCmd::Run { label, repo, cmd } => {
+            let store = open_store(&repo)?;
+            let code = run::run_wrapped(&store, label.as_deref(), &cmd)?;
+            // Mirror the wrapped command's exit code exactly.
+            std::process::exit(code);
         }
     }
 }
