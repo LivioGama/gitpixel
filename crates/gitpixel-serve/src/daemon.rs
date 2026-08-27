@@ -44,9 +44,56 @@ enum Msg {
     Fs(notify::Event),
 }
 
-/// Run the daemon in the foreground until Shutdown, idle timeout, or error.
+/// A corpus a daemon can serve: the repo `Service`, or the machine-wide
+/// transcript recall service. The transport (socket, watcher, debounce,
+/// framing) is identical for every corpus.
+pub trait Corpus {
+    /// Root that keys the socket path and is watched by default.
+    fn root(&self) -> &Path;
+    fn handle(&mut self, req: Request) -> Response;
+    /// Debounced watcher callback with the absolute changed path.
+    fn apply_change(&mut self, abs: &Path, removed: bool);
+    /// Directories the watcher observes (default: the root).
+    fn watch_paths(&self) -> Vec<PathBuf> {
+        vec![self.root().to_path_buf()]
+    }
+}
+
+impl Corpus for Service {
+    fn root(&self) -> &Path {
+        Service::root(self)
+    }
+
+    fn handle(&mut self, req: Request) -> Response {
+        Service::handle(self, req)
+    }
+
+    fn apply_change(&mut self, abs: &Path, removed: bool) {
+        let root = Service::root(self).to_path_buf();
+        let Ok(rel) = abs.strip_prefix(&root) else {
+            return;
+        };
+        let rel = rel.to_string_lossy().into_owned();
+        if rel.is_empty() {
+            return;
+        }
+        if removed {
+            self.remove_file(&rel);
+        } else {
+            self.refresh_file(&rel);
+        }
+    }
+}
+
+/// Run the repo daemon in the foreground until Shutdown, idle timeout, or
+/// error.
 pub fn run(root: &Path) -> Result<(), ServeError> {
-    let mut service = Service::open(root)?;
+    let service = Service::open(root)?;
+    run_corpus(service)
+}
+
+/// Run any corpus daemon in the foreground.
+pub fn run_corpus(mut service: impl Corpus) -> Result<(), ServeError> {
     let root = service.root().to_path_buf();
     let sock = socket_path(&root);
 
@@ -90,9 +137,12 @@ pub fn run(root: &Path) -> Result<(), ServeError> {
         }
     })
     .map_err(|e| ServeError::Msg(format!("watcher init: {e}")))?;
-    watcher
-        .watch(&root, RecursiveMode::Recursive)
-        .map_err(|e| ServeError::Msg(format!("watch {}: {e}", root.display())))?;
+    let watch_paths = service.watch_paths();
+    for wp in &watch_paths {
+        watcher
+            .watch(wp, RecursiveMode::Recursive)
+            .map_err(|e| ServeError::Msg(format!("watch {}: {e}", wp.display())))?;
+    }
 
     eprintln!(
         "gitpixel daemon: root={} socket={}",
@@ -100,8 +150,8 @@ pub fn run(root: &Path) -> Result<(), ServeError> {
         sock.display()
     );
 
-    // rel path -> removed?
-    let mut pending: BTreeMap<String, bool> = BTreeMap::new();
+    // absolute path -> removed?
+    let mut pending: BTreeMap<PathBuf, bool> = BTreeMap::new();
     let mut flush_at: Option<Instant> = None;
     let mut last_activity = Instant::now();
     let mut shutdown = false;
@@ -122,7 +172,7 @@ pub fn run(root: &Path) -> Result<(), ServeError> {
                 handle_conn(&mut service, stream, &mut shutdown);
             }
             Ok(Msg::Fs(ev)) => {
-                record_event(&root, &ev, &mut pending);
+                record_event(&ev, &mut pending);
                 if !pending.is_empty() {
                     flush_at = Some(Instant::now() + DEBOUNCE);
                 }
@@ -134,12 +184,8 @@ pub fn run(root: &Path) -> Result<(), ServeError> {
         if let Some(at) = flush_at
             && Instant::now() >= at
         {
-            for (rel, removed) in std::mem::take(&mut pending) {
-                if removed {
-                    service.remove_file(&rel);
-                } else {
-                    service.refresh_file(&rel);
-                }
+            for (abs, removed) in std::mem::take(&mut pending) {
+                service.apply_change(&abs, removed);
             }
             flush_at = None;
         }
@@ -155,12 +201,9 @@ pub fn run(root: &Path) -> Result<(), ServeError> {
     Ok(())
 }
 
-fn record_event(root: &Path, ev: &notify::Event, pending: &mut BTreeMap<String, bool>) {
+fn record_event(ev: &notify::Event, pending: &mut BTreeMap<PathBuf, bool>) {
     for path in &ev.paths {
-        let Ok(rel) = path.strip_prefix(root) else {
-            continue;
-        };
-        if rel.components().any(|c| match c {
+        if path.components().any(|c| match c {
             Component::Normal(s) => IGNORED_DIRS.iter().any(|d| s == *d),
             _ => false,
         }) {
@@ -170,16 +213,12 @@ fn record_event(root: &Path, ev: &notify::Event, pending: &mut BTreeMap<String, 
             continue;
         }
         let removed = matches!(ev.kind, notify::EventKind::Remove(_)) || !path.exists();
-        let rel = rel.to_string_lossy().into_owned();
-        if rel.is_empty() {
-            continue;
-        }
         // A later create/modify wins over an earlier remove and vice versa.
-        pending.insert(rel, removed);
+        pending.insert(path.clone(), removed);
     }
 }
 
-fn handle_conn(service: &mut Service, stream: UnixStream, shutdown: &mut bool) {
+fn handle_conn(service: &mut dyn Corpus, stream: UnixStream, shutdown: &mut bool) {
     let _ = stream.set_read_timeout(Some(Duration::from_secs(1)));
     let mut reader = BufReader::new(match stream.try_clone() {
         Ok(s) => s,

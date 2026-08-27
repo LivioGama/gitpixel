@@ -21,7 +21,7 @@ use gitpixel_graph::{EdgeKind, EdgeRow, GraphStore, SymbolKind, SymbolRow};
 pub const GRAPH_DB_FILE: &str = "graph.db";
 /// Increment whenever the daemon request/response contract changes in a way
 /// that an older process cannot safely serve to a newer CLI.
-pub const PROTOCOL_VERSION: u64 = 4;
+pub const PROTOCOL_VERSION: u64 = 5;
 
 // ---------------------------------------------------------------------------
 // errors
@@ -64,6 +64,14 @@ impl From<std::io::Error> for ServeError {
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum Request {
     Ping,
+    /// Transcript-corpus operation, served only by a recall daemon (a repo
+    /// daemon answers it with an "unsupported" error). `action` selects the
+    /// recall op ("search" | "ask"); `params` is its argument object.
+    Recall {
+        action: String,
+        #[serde(default)]
+        params: Value,
+    },
     Search {
         pattern: String,
         #[serde(default)]
@@ -273,6 +281,10 @@ impl Service {
                 "protocol_version": PROTOCOL_VERSION,
             })),
             Request::Shutdown => Ok(json!({"shutting_down": true})),
+            Request::Recall { .. } => Err(
+                "recall ops are served by the recall daemon (`gitpixel recall daemon start`), not a repository daemon"
+                    .to_string(),
+            ),
             Request::Search {
                 pattern,
                 json: _,

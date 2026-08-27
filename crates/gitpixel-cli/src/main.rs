@@ -10,6 +10,7 @@ use std::time::Duration;
 
 use clap::{Parser, Subcommand, ValueEnum};
 
+mod recall_cmd;
 mod sniper_cmd;
 use gitpixel_core::index::{build, shard_path};
 use gitpixel_core::shard::Shard;
@@ -197,6 +198,11 @@ enum Command {
     Daemon {
         #[command(subcommand)]
         cmd: DaemonCmd,
+    },
+    /// Search and browse LLM CLI transcripts (machine-wide corpus).
+    Recall {
+        #[command(subcommand)]
+        cmd: recall_cmd::RecallCmd,
     },
     /// One-look error capture: query the sniper error sink (CLI + MCP).
     Sniper {
@@ -1000,6 +1006,7 @@ fn run() -> Result<(), String> {
             DaemonCmd::Stop { path } => daemon_stop(discover_root(&path)?),
             DaemonCmd::Status { path } => daemon_status(discover_root(&path)?),
         },
+        Command::Recall { cmd } => recall_cmd::run_recall(cmd),
         Command::Sniper { cmd } => sniper_cmd::run_sniper(cmd),
     }
 }

@@ -23,6 +23,8 @@ A Rust sidecar that replaces grep-style scanning and stale code-graph tools with
 
 🎯 **Error sniper** — One-look error capture: a per-repository SQLite sink (WAL, dedup with repeat counters, retention) that collects runtime, HTTP-5xx, build, and test failures at throw-time with source-mapped frames, package provenance (duplicate-copy detection), run fingerprints, and HMR/lifecycle events. Queried in one call via `gitpixel sniper` or its stdio MCP server (`rmcp`); fed by `gitpixel sniper run -- <cmd>` (tsc-aware) and the `@gitpixel/sniper` JS companion in `js/sniper` (Vite dev plugin, browser client, vitest reporter).
 
+🧠 **Transcript recall** — Machine-wide retrieval over every LLM CLI's transcripts (Claude Code incl. subagents, Codex, opencode, Cursor CLI, Devin, zcode, Gemini history): streaming/cursor-based incremental ingest into one SQLite corpus of turn-granular text, trigram segments reusing the shard engine (turn-rowid doc trick), and a semantic channel (multilingual-e5-small int8 ONNX via fastembed, i8-quantized brute-force mmap vector segments with exact metadata pre-filtering) fused by RRF. `gitpixel recall ask 'where did we discuss dropping svelte'` goes straight to the session; `maxtest` ranks remembered keywords by rarity to pin a session; a recall daemon watches the source stores, keeps the corpus fresh, and holds the model warm.
+
 ## 🔧 Installation
 
 ### From source (release build)
@@ -65,6 +67,12 @@ target/release/gitpixel daemon start /path/to/repo
 
 # Agent bootstrap in one command: text index + graph + warm daemon
 target/release/gitpixel ready /path/to/repo
+
+# Capture every error from a command into the queryable sink
+target/release/gitpixel sniper run -- bunx tsc --noEmit
+
+# Search every LLM CLI transcript on the machine ("where did we discuss X?")
+target/release/gitpixel recall index && target/release/gitpixel recall ask 'where did we discuss dropping svelte'
 ```
 
 ## 📖 Usage Examples
@@ -184,6 +192,31 @@ target/release/gitpixel sniper mcp
 
 Vite apps adopt capture in two lines with the JS companion — see [js/sniper/README.md](js/sniper/README.md).
 
+### Transcript recall
+
+```bash
+# One-time bootstrap
+gitpixel recall index                 # ingest all CLI transcript stores
+gitpixel recall setup                 # download the embedding model (~110 MB)
+gitpixel recall embed                 # semantic backfill (resumable)
+gitpixel recall daemon start          # fresh corpus + warm model
+
+# Straight-to-target queries
+gitpixel recall ask 'where did we discuss dropping svelte'
+gitpixel recall search 'dokploy-network' --repo ~/Documents/foo --since 3w
+gitpixel recall maxtest 'svelte,trigram,dokploy'   # rarest keyword pins the session
+gitpixel recall sessions --agent codex --since 7d
+gitpixel recall show claude:75deefa9 --turn 0..5
+gitpixel recall context 'the unix socket permissions bug' --budget 4000
+gitpixel recall status
+```
+
+The corpus lives at `~/.local/share/gitpixel/recall/` (mode 0700 — it concentrates every
+transcript on the machine). Text is stored denormalized so the corpus outlives source
+rotation; tool outputs are capped at 4 KB with a `truncated` flag; harness-injected
+"user" text is classified `orchestrator` and excluded from the semantic index; Cursor
+timestamps are file mtimes and every output carries its `ts_source`.
+
 ## 🎨 Design Notes
 
 - **Trigram is the default extractor.** Cursor-style sparse n-grams remain available through `--extractor sparse`; the historical exploratory measurements that informed the default are archived in [docs/bench/phase1.md](docs/bench/phase1.md), but are not a current reproducible performance claim.
@@ -211,6 +244,8 @@ Vite apps adopt capture in two lines with the JS companion — see [js/sniper/RE
 | Code graph extraction | Tests cover extraction, receiver preservation, named-import specificity, wildcard-import ambiguity, incremental definition ambiguity, and test-container exclusion |
 | Daemon | Tests cover Unicode framing, oversized-frame rejection, and absolute read deadlines; public start/status/search/stop and stale-protocol fallback paths are exercised before release |
 | Token-budgeted context | Tests require the complete serialized response to remain inside 50- and 500-token budgets |
+| Error sniper | 100+ workspace tests over store/dedup/query/format/MCP; CLI + stdio MCP smoke-tested live against real tsc/vite failures |
+| Transcript recall (lexical) | Verified against the full real corpus on this machine: 1,016,849 turns / 7 CLIs ingested with 0 parse errors; session-set parity with `grep -r` ground truth on multiple terms; incremental re-index is a sub-second no-op; maxtest pins known sessions |
 
 ### ❌ Missing / Deferred (treat outputs as best-effort)
 
@@ -224,6 +259,9 @@ Vite apps adopt capture in two lines with the JS companion — see [js/sniper/RE
 | **Windows** | Unix-socket daemon path is Unix-only | Not supported |
 | **Scale benchmarks** | Freshness daemon unbenchmarked on large monorepos | Next milestone |
 | **GitNexus comparison** | No paired retrieval-quality, latency, subprocess, or token artifact exists yet | Required before claiming replacement performance |
+| **Recall semantic quality** | hit@5 measured on a 10-query eval, but no large labeled benchmark; embedding-exclusion policy (orchestrator/tool noise) validated by inspection only | Expand the eval set |
+| **Recall source coverage** | Cursor GUI chat bodies and Gemini conversation payloads are opaque binary blobs — not ingested; Codex encrypted `reasoning` records excluded by design | Blocked on reverse engineering |
+| **Cursor timestamps** | Cursor CLI records carry no timestamps; turn times are file mtimes (`ts_source: "mtime"` disclosed in every output) | Inherent to the source |
 
 ### How to read graph outputs until harnesses land
 
@@ -233,7 +271,7 @@ Vite apps adopt capture in two lines with the JS companion — see [js/sniper/RE
 
 ## 📝 Status
 
-Working v1 with bounded search/context responses, freshness regression coverage, tiered graph resolution, and a persistent local daemon. Graph property harnesses, long-run daemon testing, MCP transport, and reproducible comparisons remain open. See **Caveats** before relying on broad graph conclusions or performance claims.
+Working v1 with bounded search/context responses, freshness regression coverage, tiered graph resolution, a persistent local daemon, the sniper error sink (CLI + stdio MCP), and machine-wide transcript recall (hybrid trigram + local-embedding retrieval over every LLM CLI's sessions, with its own watcher daemon). Graph property harnesses, long-run daemon testing, the main MCP transport, and reproducible comparisons remain open. See **Caveats** before relying on broad graph conclusions or performance claims.
 
 ## 🤝 Contributing
 
