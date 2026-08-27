@@ -309,6 +309,22 @@ fn scan_ordered(
     Ok(false)
 }
 
+/// Trigram-candidate count for a pattern — `None` when the pattern has no
+/// required literals (every turn matches). Cheap: postings only, no SQL,
+/// no verification. Used to skip uselessly common words in ask's lexical
+/// channel.
+pub fn candidate_count(segments: &SegmentSet, pattern: &str) -> Option<usize> {
+    let plan = plan_pattern(pattern, &TrigramExtractor).ok()?;
+    if matches!(plan, GramQuery::All) {
+        return None;
+    }
+    let mut total = 0usize;
+    for shard in segments.open_shards() {
+        total += resolve_query(&plan, shard.file_count(), &|h| shard.postings(h)).len();
+    }
+    Some(total)
+}
+
 /// Compact one-line rendering of a hit, shared by CLI and daemon.
 pub fn format_hit(h: &SearchHit) -> String {
     let ts = h

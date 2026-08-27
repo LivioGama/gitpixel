@@ -238,18 +238,32 @@ impl RecallService {
             }
             Err(e) => eprintln!("recall daemon: segments: {e}"),
         }
-        self.ensure_embedder();
-        if let Some(embedder) = self.embedder.as_deref_mut() {
-            let mut vectors = match VectorStore::open(&gitpixel_recall::vectors_dir()) {
-                Ok(v) => v,
-                Err(e) => {
-                    eprintln!("recall daemon: vectors: {e}");
-                    return;
+        // Drain the embed backlog only when it is small: the daemon loop is
+        // single-threaded, and a bulk backfill here would block the socket
+        // for minutes (that is `gitpixel recall embed`'s job).
+        const MAX_INLINE_BACKLOG: i64 = 5_000;
+        match self.store.embed_backlog() {
+            Ok(backlog) if backlog > 0 && backlog <= MAX_INLINE_BACKLOG => {
+                self.ensure_embedder();
+                if let Some(embedder) = self.embedder.as_deref_mut() {
+                    let mut vectors = match VectorStore::open(&gitpixel_recall::vectors_dir()) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            eprintln!("recall daemon: vectors: {e}");
+                            return;
+                        }
+                    };
+                    if let Err(e) = run_backfill(&self.store, &mut vectors, embedder, |_, _| {}) {
+                        eprintln!("recall daemon: embed: {e}");
+                    }
                 }
-            };
-            if let Err(e) = run_backfill(&self.store, &mut vectors, embedder, |_, _| {}) {
-                eprintln!("recall daemon: embed: {e}");
             }
+            Ok(backlog) if backlog > MAX_INLINE_BACKLOG => {
+                eprintln!(
+                    "recall daemon: embed backlog {backlog} exceeds inline cap — run `gitpixel recall embed`"
+                );
+            }
+            _ => {}
         }
     }
 }

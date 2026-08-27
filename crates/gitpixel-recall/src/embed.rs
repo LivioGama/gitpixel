@@ -60,20 +60,49 @@ pub fn embed_text(agent: &str, cwd: Option<&str>, role: &str, chunk: &str) -> St
     format!("[{agent}] [{repo}] {role}: {chunk}")
 }
 
-/// Open the default embedding model (multilingual-e5-small via fastembed)
-/// from the shared model cache. Errors when the build has no embedding
-/// support or the model is absent and `download` is false — callers treat
-/// that as "semantic channel unavailable", never as a crash.
+pub const POTION_MODEL_ID: &str = "potion-multilingual-128m";
+pub const E5_MODEL_ID: &str = "multilingual-e5-small-q";
+
+/// The model id the existing vector store was built with, if any.
+fn stored_model_id() -> Option<String> {
+    let bytes = std::fs::read(crate::vectors_dir().join("meta.json")).ok()?;
+    let meta: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    let id = meta.get("model_id")?.as_str()?.to_string();
+    (!id.is_empty()).then_some(id)
+}
+
+/// Open the default embedding model from the shared model cache.
+///
+/// Resolution: `GITPIXEL_RECALL_MODEL` env ("potion" | "e5") → the model
+/// the existing vector store was built with → potion (the fast static
+/// tier; ~3 orders of magnitude faster than transformer inference, which
+/// makes the full-corpus backfill minutes instead of hours). Errors when
+/// the build lacks embedding support or the model is absent and
+/// `download` is false — callers treat that as "semantic channel
+/// unavailable", never as a crash.
 pub fn open_default_embedder(download: bool) -> Result<Box<dyn Embedder>, String> {
-    #[cfg(feature = "fastembed")]
+    let choice = match std::env::var("GITPIXEL_RECALL_MODEL") {
+        Ok(v) if !v.is_empty() => v,
+        _ => stored_model_id().unwrap_or_else(|| POTION_MODEL_ID.to_string()),
+    };
+    if choice.contains("e5") {
+        #[cfg(feature = "fastembed")]
+        {
+            return fast::FastEmbedder::open(&crate::models_dir(), download)
+                .map(|e| Box::new(e) as Box<dyn Embedder>);
+        }
+        #[cfg(not(feature = "fastembed"))]
+        return Err("e5 requested but this build lacks the fastembed feature".to_string());
+    }
+    #[cfg(feature = "model2vec")]
     {
-        fast::FastEmbedder::open(&crate::models_dir(), download)
+        potion::PotionEmbedder::open(&crate::models_dir(), download)
             .map(|e| Box::new(e) as Box<dyn Embedder>)
     }
-    #[cfg(not(feature = "fastembed"))]
+    #[cfg(not(feature = "model2vec"))]
     {
         let _ = download;
-        Err("this build has no embedding support (fastembed feature disabled)".to_string())
+        Err("this build has no embedding support (model2vec feature disabled)".to_string())
     }
 }
 
@@ -107,8 +136,13 @@ pub fn run_backfill(
     let mut pending_rows: Vec<(i64, Vec<f32>)> = Vec::new();
     let mut pending_turns: Vec<i64> = Vec::new();
     store.mark_policy_skips().map_err(|e| e.to_string())?;
+    // Keyset cursor over turn ids: rows behind it are either flushed or
+    // sitting in `pending_rows` awaiting flush — never re-fetched.
+    let mut after_id = 0i64;
     loop {
-        let batch = store.pending_embed(BATCH_TURNS).map_err(|e| e.to_string())?;
+        let batch = store
+            .pending_embed(after_id, BATCH_TURNS)
+            .map_err(|e| e.to_string())?;
         if batch.is_empty() {
             // Ingest may have added policy-excluded turns concurrently;
             // sweep once more and only stop when both queues are empty.
@@ -118,6 +152,7 @@ pub fn run_backfill(
             }
             continue;
         }
+        after_id = batch.last().map(|t| t.turn_id).unwrap_or(after_id);
         let mut texts: Vec<String> = Vec::new();
         let mut chunk_ids: Vec<i64> = Vec::new();
         for turn in &batch {
@@ -173,6 +208,70 @@ fn flush(
     rows.clear();
     turns.clear();
     Ok(())
+}
+
+#[cfg(feature = "model2vec")]
+pub mod potion {
+    use super::{EmbedKind, Embedder};
+    use std::path::Path;
+
+    /// Static-embedding fast tier (Model2Vec potion-multilingual-128M,
+    /// 256d, distilled from bge-m3). No transformer inference: token
+    /// lookups + pooling, so bulk backfill runs at tens of thousands of
+    /// texts per second on CPU.
+    pub struct PotionEmbedder {
+        model: model2vec_rs::model::StaticModel,
+        dims: usize,
+    }
+
+    const REPO: &str = "minishlab/potion-multilingual-128M";
+
+    impl PotionEmbedder {
+        pub fn open(cache_dir: &Path, download: bool) -> Result<Self, String> {
+            let marker = cache_dir.join("potion.ok");
+            if !download && !marker.exists() {
+                return Err(
+                    "embedding model not present — run `gitpixel recall setup` first".to_string(),
+                );
+            }
+            let _ = std::fs::create_dir_all(cache_dir);
+            // Route the HF hub cache under gitpixel's model dir. set_var is
+            // process-global; both CLI and daemon call this before any
+            // threads that read the environment.
+            unsafe {
+                std::env::set_var("HF_HOME", cache_dir.join("hf"));
+            }
+            let model = model2vec_rs::model::StaticModel::from_pretrained(REPO, None, None, None)
+                .map_err(|e| format!("potion model load: {e}"))?;
+            let dims = model.encode_single("probe").len();
+            if dims == 0 {
+                return Err("potion model produced empty embeddings".to_string());
+            }
+            if download {
+                let _ = std::fs::write(&marker, REPO);
+            }
+            Ok(Self { model, dims })
+        }
+    }
+
+    impl Embedder for PotionEmbedder {
+        fn model_id(&self) -> &str {
+            super::POTION_MODEL_ID
+        }
+
+        fn dims(&self) -> usize {
+            self.dims
+        }
+
+        fn embed_batch(
+            &mut self,
+            texts: &[&str],
+            _kind: EmbedKind, // static embeddings have no query/passage split
+        ) -> Result<Vec<Vec<f32>>, String> {
+            let owned: Vec<String> = texts.iter().map(|t| t.to_string()).collect();
+            Ok(self.model.encode_with_args(&owned, Some(512), 1024))
+        }
+    }
 }
 
 #[cfg(feature = "fastembed")]
@@ -237,6 +336,80 @@ pub mod fast {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct StubEmbedder;
+
+    impl Embedder for StubEmbedder {
+        fn model_id(&self) -> &str {
+            "stub"
+        }
+        fn dims(&self) -> usize {
+            4
+        }
+        fn embed_batch(
+            &mut self,
+            texts: &[&str],
+            _kind: EmbedKind,
+        ) -> Result<Vec<Vec<f32>>, String> {
+            Ok(texts.iter().map(|_| vec![0.5; 4]).collect())
+        }
+    }
+
+    /// Regression: turns are only marked embedded at segment flush, so the
+    /// backfill must page by id — a head query would re-chunk and re-embed
+    /// the same batch until the flush threshold (once produced a 65×
+    /// duplication of every chunk on the real corpus).
+    #[test]
+    fn backfill_embeds_each_turn_exactly_once() {
+        use crate::model::{Role, TsSource, UnifiedSession, UnifiedTurn};
+        let dir = std::env::temp_dir().join(format!("gpx-embed-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut store = crate::store::RecallStore::open(&dir.join("recall.db")).unwrap();
+        let session = UnifiedSession {
+            agent: "claude",
+            source_session_id: "s1".into(),
+            source_path: "test".into(),
+            cwd: Some("/tmp/x".into()),
+            git_branch: None,
+            title: None,
+            ts_source: TsSource::Iso,
+            is_subagent: false,
+            parent_source_session_id: None,
+        };
+        // More turns than one batch so the loop must page past BATCH_TURNS
+        // without a flush in between (FLUSH_CHUNKS >> turn count here).
+        let turns: Vec<UnifiedTurn> = (0..300)
+            .map(|i| UnifiedTurn {
+                role: Role::Assistant,
+                intent_source: None,
+                ts: Some(i),
+                text: format!("turn number {i}"),
+                truncated: false,
+                source_byte_start: None,
+                source_byte_len: None,
+            })
+            .collect();
+        let st = crate::store::IngestState {
+            file_size: 1,
+            mtime_ms: 1,
+            bytes_ingested: 1,
+            cursor: None,
+        };
+        store.replace_session(&session, &turns, "u1", &st).unwrap();
+
+        let mut vectors = crate::vector::VectorStore::open(&dir.join("vectors")).unwrap();
+        let mut embedder = StubEmbedder;
+        let report = run_backfill(&store, &mut vectors, &mut embedder, |_, _| {}).unwrap();
+        assert_eq!(report.turns_embedded, 300);
+        let chunk_count: i64 = store
+            .connection()
+            .query_row("SELECT COUNT(*) FROM vector_chunks", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(chunk_count, 300, "each short turn must yield exactly one chunk");
+        assert_eq!(store.embed_backlog().unwrap(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn chunking_covers_and_overlaps() {

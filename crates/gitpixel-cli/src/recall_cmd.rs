@@ -344,21 +344,13 @@ fn run_context(
         since_ms: since.as_deref().map(|s| parse_time(s, now)).transpose()?,
         ..Default::default()
     };
-    #[cfg(feature = "fastembed")]
     let mut embedder_slot = if lexical_only {
         None
     } else {
-        open_embedder(false).ok()
+        gitpixel_recall::embed::open_default_embedder(false).ok()
     };
-    #[cfg(feature = "fastembed")]
-    let embedder: Option<&mut dyn gitpixel_recall::embed::Embedder> = embedder_slot
-        .as_mut()
-        .map(|e| e as &mut dyn gitpixel_recall::embed::Embedder);
-    #[cfg(not(feature = "fastembed"))]
-    let embedder: Option<&mut dyn gitpixel_recall::embed::Embedder> = {
-        let _ = lexical_only;
-        None
-    };
+    let embedder: Option<&mut (dyn gitpixel_recall::embed::Embedder + 'static)> =
+        embedder_slot.as_deref_mut();
     let result =
         gitpixel_recall::ask::ask(&store, &segments, &vectors, embedder, query, &filters, 10)?;
 
@@ -423,64 +415,46 @@ fn run_context(
     Ok(())
 }
 
-#[cfg(feature = "fastembed")]
-fn open_embedder(download: bool) -> Result<gitpixel_recall::embed::fast::FastEmbedder, String> {
-    gitpixel_recall::embed::fast::FastEmbedder::open(&gitpixel_recall::models_dir(), download)
-}
-
 fn run_setup() -> Result<(), String> {
-    #[cfg(feature = "fastembed")]
-    {
-        use gitpixel_recall::embed::{EmbedKind, Embedder};
-        eprintln!(
-            "downloading embedding model into {} …",
-            gitpixel_recall::models_dir().display()
-        );
-        let mut embedder = open_embedder(true)?;
-        let probe = embedder.embed_batch(&["setup probe"], EmbedKind::Query)?;
-        println!(
-            "model ready: {} ({}d, probe embedding ok)",
-            embedder.model_id(),
-            probe[0].len()
-        );
-        Ok(())
-    }
-    #[cfg(not(feature = "fastembed"))]
-    Err("this build has no embedding support (fastembed feature disabled)".to_string())
+    use gitpixel_recall::embed::{EmbedKind, open_default_embedder};
+    eprintln!(
+        "downloading embedding model into {} …",
+        gitpixel_recall::models_dir().display()
+    );
+    let mut embedder = open_default_embedder(true)?;
+    let probe = embedder.embed_batch(&["setup probe"], EmbedKind::Query)?;
+    println!(
+        "model ready: {} ({}d, probe embedding ok)",
+        embedder.model_id(),
+        probe[0].len()
+    );
+    Ok(())
 }
 
 fn run_embed(rebuild: bool) -> Result<(), String> {
-    #[cfg(feature = "fastembed")]
-    {
-        let store = open_store()?;
-        let mut vectors = gitpixel_recall::vector::VectorStore::open(&gitpixel_recall::vectors_dir())?;
-        if rebuild {
-            vectors.clear()?;
-            store.reset_embeddings().map_err(|e| e.to_string())?;
-            eprintln!("vector store cleared; re-embedding entire corpus");
-        }
-        let mut embedder = open_embedder(false)?;
-        let report = gitpixel_recall::embed::run_backfill(
-            &store,
-            &mut vectors,
-            &mut embedder,
-            |done, backlog| eprintln!("  embedded {done} turns, {backlog} remaining"),
-        )?;
-        println!(
-            "embedded {} turns ({} chunks) into {} segment(s), {} ms — backlog {}",
-            report.turns_embedded,
-            report.chunks_written,
-            report.segments_written,
-            report.elapsed_ms,
-            report.backlog_remaining
-        );
-        Ok(())
+    let store = open_store()?;
+    let mut vectors = gitpixel_recall::vector::VectorStore::open(&gitpixel_recall::vectors_dir())?;
+    if rebuild {
+        vectors.clear()?;
+        store.reset_embeddings().map_err(|e| e.to_string())?;
+        eprintln!("vector store cleared; re-embedding entire corpus");
     }
-    #[cfg(not(feature = "fastembed"))]
-    {
-        let _ = rebuild;
-        Err("this build has no embedding support (fastembed feature disabled)".to_string())
-    }
+    let mut embedder = gitpixel_recall::embed::open_default_embedder(false)?;
+    let report = gitpixel_recall::embed::run_backfill(
+        &store,
+        &mut vectors,
+        embedder.as_mut(),
+        |done, backlog| eprintln!("  embedded {done} turns, {backlog} remaining"),
+    )?;
+    println!(
+        "embedded {} turns ({} chunks) into {} segment(s), {} ms — backlog {}",
+        report.turns_embedded,
+        report.chunks_written,
+        report.segments_written,
+        report.elapsed_ms,
+        report.backlog_remaining
+    );
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -524,21 +498,13 @@ fn run_ask(
         return Ok(());
     }
 
-    #[cfg(feature = "fastembed")]
     let mut embedder_slot = if lexical_only {
         None
     } else {
-        match open_embedder(false) {
-            Ok(e) => Some(e),
-            Err(_) => None, // model absent → honest lexical-only notice below
-        }
+        gitpixel_recall::embed::open_default_embedder(false).ok()
     };
-    #[cfg(feature = "fastembed")]
-    let embedder: Option<&mut dyn gitpixel_recall::embed::Embedder> = embedder_slot
-        .as_mut()
-        .map(|e| e as &mut dyn gitpixel_recall::embed::Embedder);
-    #[cfg(not(feature = "fastembed"))]
-    let embedder: Option<&mut dyn gitpixel_recall::embed::Embedder> = None;
+    let embedder: Option<&mut (dyn gitpixel_recall::embed::Embedder + 'static)> =
+        embedder_slot.as_deref_mut();
 
     let result = gitpixel_recall::ask::ask(
         &store, &segments, &vectors, embedder, query, &filters, k,

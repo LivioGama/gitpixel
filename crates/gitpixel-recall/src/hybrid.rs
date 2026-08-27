@@ -8,7 +8,7 @@
 use std::collections::HashMap;
 
 const RRF_K: f32 = 60.0;
-const LEXICAL_WEIGHT: f32 = 1.2;
+const LEXICAL_WEIGHT: f32 = 2.0;
 const SEMANTIC_WEIGHT: f32 = 1.0;
 
 /// Fuse two ranked turn-id lists into one, best first.

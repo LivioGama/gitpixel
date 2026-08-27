@@ -96,7 +96,24 @@ pub fn ask(
     k: usize,
 ) -> Result<AskResult, String> {
     // --- lexical channel: rank turns by how many query words they contain.
+    // Harness-injected "user" text (system reminders, global rules) repeats
+    // in nearly every session and would drown discussion content, so the
+    // ask channels always skip orchestrator turns — `recall search` remains
+    // the raw view.
+    let mut lexical_filters = filters.clone();
+    lexical_filters.human_only = true;
     let words = query_words(query);
+    // Words present in a large share of the corpus discriminate nothing
+    // and cost seconds of fetch+verify — drop them from the lexical
+    // channel (the semantic channel still sees the full query).
+    const MAX_WORD_CANDIDATES: usize = 50_000;
+    let words: Vec<String> = words
+        .into_iter()
+        .filter(|w| {
+            crate::search::candidate_count(segments, &word_pattern(w))
+                .is_some_and(|c| c <= MAX_WORD_CANDIDATES)
+        })
+        .collect();
     let mut word_hits: HashMap<i64, (usize, Option<i64>)> = HashMap::new();
     for word in &words {
         let result = search(
@@ -104,7 +121,7 @@ pub fn ask(
             segments,
             &word_pattern(word),
             false,
-            filters,
+            &lexical_filters,
             0,
             usize::MAX,
         )?;

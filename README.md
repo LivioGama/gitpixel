@@ -246,6 +246,7 @@ timestamps are file mtimes and every output carries its `ts_source`.
 | Token-budgeted context | Tests require the complete serialized response to remain inside 50- and 500-token budgets |
 | Error sniper | 100+ workspace tests over store/dedup/query/format/MCP; CLI + stdio MCP smoke-tested live against real tsc/vite failures |
 | Transcript recall (lexical) | Verified against the full real corpus on this machine: 1,016,849 turns / 7 CLIs ingested with 0 parse errors; session-set parity with `grep -r` ground truth on multiple terms; incremental re-index is a sub-second no-op; maxtest pins known sessions |
+| Transcript recall (semantic) | Full-corpus backfill measured: 2m32s / 267 MB of i8 vectors (potion-multilingual, 256d) for ~700k eligible turns; hybrid `ask` hit@5 = 7/10 on a 10-query eval of real remembered sessions (lexical-only baseline 5/10); daemon watcher auto-ingests a live session within seconds (verified end-to-end) |
 
 ### ❌ Missing / Deferred (treat outputs as best-effort)
 

@@ -347,14 +347,17 @@ impl RecallStore {
         )
     }
 
-    /// Next batch of turns awaiting embedding.
-    pub fn pending_embed(&self, limit: usize) -> Result<Vec<EmbedTurn>> {
+    /// Next batch of turns awaiting embedding, strictly after `after_id`.
+    /// Keyset pagination is load-bearing: turns are only MARKED embedded at
+    /// segment flush, so a head query would return the same batch forever
+    /// between flushes (and re-chunk it every iteration).
+    pub fn pending_embed(&self, after_id: i64, limit: usize) -> Result<Vec<EmbedTurn>> {
         let mut stmt = self.conn.prepare_cached(
             "SELECT t.id, t.text, s.agent, s.cwd, t.role
              FROM turns t JOIN sessions s ON s.id = t.session_id
-             WHERE t.embedded = 0 ORDER BY t.id LIMIT ?1",
+             WHERE t.embedded = 0 AND t.id > ?2 ORDER BY t.id LIMIT ?1",
         )?;
-        let rows = stmt.query_map(params![limit as i64], |r| {
+        let rows = stmt.query_map(params![limit as i64, after_id], |r| {
             Ok(EmbedTurn {
                 turn_id: r.get(0)?,
                 text: r.get(1)?,
