@@ -47,22 +47,66 @@ pub struct AskResult {
 const CHANNEL_DEPTH: usize = 200;
 const SEM_SNIPPET_LEN: usize = 160;
 
-/// Words worth matching lexically: 3+ chars, identifier-ish.
+/// Words worth matching lexically: 2+ chars, identifier-ish.
+///
+/// Two-character tokens (`cd`, `rg`, `ls`, `-C`) are frequently *the*
+/// discriminating term in a tooling question. The former 3-char floor made
+/// such queries structurally unanswerable — no amount of ranking could
+/// recover a word that was never searched.
+///
+/// No cap is applied here: which words survive is decided by rarity in
+/// `ask`, not by where they happened to fall in the sentence.
 fn query_words(query: &str) -> Vec<String> {
     let mut seen = HashSet::new();
     let mut out = Vec::new();
     for token in query.split(|c: char| !(c.is_alphanumeric() || c == '_' || c == '-' || c == '.')) {
         let t = token.trim_matches(|c: char| c == '.' || c == '-');
-        if t.len() < 3 {
+        if t.len() < 2 {
             continue;
         }
         let key = t.to_lowercase();
-        if seen.insert(key) && out.len() < 8 {
+        if t.len() == 2 && SHORT_STOPWORDS.contains(&key.as_str()) {
+            continue;
+        }
+        if seen.insert(key) {
             out.push(t.to_string());
         }
     }
     out
 }
+
+/// Two-character function words. These need an explicit list because a 2-char
+/// pattern has no indexable trigram, so the corpus cannot cost it — the rarity
+/// filter that handles common longer words is blind to them. Left in, they
+/// consume the scarce full-scan budget that `cd` or `rg` needs.
+const SHORT_STOPWORDS: &[&str] = &[
+    "am", "an", "as", "at", "be", "by", "do", "go", "he", "if", "in", "is", "it", "me", "my", "no",
+    "of", "on", "or", "so", "to", "up", "us", "we",
+];
+
+/// How rare a word is in the corpus, as an IDF-ish weight.
+///
+/// `count` is `None` when the word's pattern has no indexable trigram (`cd`,
+/// `rg`): the index cannot cost it. That means *unknown*, not *useless* — note
+/// that `search()` reads the very same `None` from `plan_pattern` as "no
+/// candidate restriction, scan everything". Such a word is charged a middling
+/// weight rather than being silently discarded.
+fn word_weight(count: Option<usize>) -> f64 {
+    let c = count.unwrap_or(MAX_WORD_CANDIDATES / 10) as f64;
+    (MAX_WORD_CANDIDATES as f64 / (1.0 + c)).ln().max(0.1)
+}
+
+/// Words present in a large share of the corpus discriminate nothing and cost
+/// seconds of fetch+verify.
+const MAX_WORD_CANDIDATES: usize = 50_000;
+/// Most query words actually searched, chosen by rarity (not by position).
+const MAX_WORDS: usize = 8;
+/// Words the index cannot cost require a full corpus scan; allow only a couple
+/// so one vague query cannot walk every turn several times over.
+const MAX_UNCOSTED_WORDS: usize = 2;
+/// Per-word hit cap. Only bites for high-frequency words, whose weight is low
+/// anyway; rare words return far fewer hits than this and are unaffected.
+const PER_WORD_LIMIT: usize = 20_000;
 
 /// Case-variant whole-word pattern for one query word (the trigram index is
 /// case-sensitive; three variants cover the overwhelmingly common casings).
@@ -102,20 +146,44 @@ pub fn ask(
     // the raw view.
     let mut lexical_filters = filters.clone();
     lexical_filters.human_only = true;
-    let words = query_words(query);
-    // Words present in a large share of the corpus discriminate nothing
-    // and cost seconds of fetch+verify — drop them from the lexical
-    // channel (the semantic channel still sees the full query).
-    const MAX_WORD_CANDIDATES: usize = 50_000;
-    let words: Vec<String> = words
+    // Cost every candidate word against the index, then keep the *rarest*
+    // MAX_WORDS. Selecting by position instead would let "how do I ..." crowd
+    // out the one term that actually identifies the answer.
+    let mut costed: Vec<(String, Option<usize>, f64)> = query_words(query)
         .into_iter()
-        .filter(|w| {
-            crate::search::candidate_count(segments, &word_pattern(w))
-                .is_some_and(|c| c <= MAX_WORD_CANDIDATES)
+        .map(|w| {
+            let count = crate::search::candidate_count(segments, &word_pattern(&w));
+            let weight = word_weight(count);
+            (w, count, weight)
         })
+        // A word the index *can* cost, and which is everywhere, discriminates
+        // nothing. A word it cannot cost is kept — see `word_weight`.
+        .filter(|(_, count, _)| count.is_none_or(|c| c <= MAX_WORD_CANDIDATES))
         .collect();
-    let mut word_hits: HashMap<i64, (usize, Option<i64>)> = HashMap::new();
-    for word in &words {
+    costed.sort_by(|a, b| {
+        b.2.partial_cmp(&a.2)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.0.cmp(&b.0))
+    });
+    let mut uncosted_used = 0usize;
+    let words: Vec<(String, f64)> = costed
+        .into_iter()
+        .filter(|(_, count, _)| {
+            if count.is_some() {
+                return true;
+            }
+            uncosted_used += 1;
+            uncosted_used <= MAX_UNCOSTED_WORDS
+        })
+        .take(MAX_WORDS)
+        .map(|(w, _, weight)| (w, weight))
+        .collect();
+
+    // Score a turn by the summed rarity of the query words it contains, not by
+    // how many it contains: matching "absolute" and "paths" says far more than
+    // matching "use" and "the".
+    let mut word_hits: HashMap<i64, (f64, Option<i64>)> = HashMap::new();
+    for (word, weight) in &words {
         let result = search(
             store,
             segments,
@@ -123,18 +191,26 @@ pub fn ask(
             false,
             &lexical_filters,
             0,
-            usize::MAX,
+            PER_WORD_LIMIT,
         )?;
         for hit in result.hits {
-            let entry = word_hits.entry(hit.turn_id).or_insert((0, hit.ts));
-            entry.0 += 1;
+            let entry = word_hits.entry(hit.turn_id).or_insert((0.0, hit.ts));
+            entry.0 += weight;
         }
     }
-    let mut lexical_ranked: Vec<(i64, usize, Option<i64>)> = word_hits
+    let mut lexical_ranked: Vec<(i64, f64, Option<i64>)> = word_hits
         .iter()
-        .map(|(id, (count, ts))| (*id, *count, *ts))
+        .map(|(id, (score, ts))| (*id, *score, *ts))
         .collect();
-    lexical_ranked.sort_by(|a, b| b.1.cmp(&a.1).then(b.2.cmp(&a.2)).then(b.0.cmp(&a.0)));
+    // Rank by score. Recency is only a deterministic tiebreak between equally
+    // relevant turns — as a *primary* signal it buried every older answer under
+    // whatever was written most recently.
+    lexical_ranked.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(b.2.cmp(&a.2))
+            .then(b.0.cmp(&a.0))
+    });
     let lexical: Vec<i64> = lexical_ranked
         .iter()
         .take(CHANNEL_DEPTH)
@@ -215,7 +291,7 @@ pub fn ask(
     let word_re = if words.is_empty() {
         None
     } else {
-        let alts: Vec<String> = words.iter().map(|w| regex::escape(w)).collect();
+        let alts: Vec<String> = words.iter().map(|(w, _)| regex::escape(w)).collect();
         regex::RegexBuilder::new(&format!(r"\b(?:{})\b", alts.join("|")))
             .case_insensitive(true)
             .build()
@@ -356,4 +432,44 @@ pub fn format_group(g: &AskSessionGroup) -> String {
         h.snippet,
         extra
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn keeps_two_char_tokens() {
+        // Regression: `cd` was dropped by a 3-char floor, which made
+        // "never use cd, use absolute paths" structurally unanswerable --
+        // `ask` returned zero groups, not merely bad ones.
+        let w = query_words("never use cd, use absolute paths instead, avoid cd in shell commands");
+        assert!(
+            w.iter().any(|x| x == "cd"),
+            "cd must survive tokenization: {w:?}"
+        );
+        // `in` is a two-char function word: it would burn a scarce full-scan
+        // slot that a discriminating token like `cd` needs.
+        assert!(!w.iter().any(|x| x.eq_ignore_ascii_case("in")), "{w:?}");
+        // Single characters stay out -- they discriminate nothing.
+        assert!(!query_words("a b c").iter().any(|x| x.len() < 2));
+    }
+
+    #[test]
+    fn no_positional_cap_on_tokenization() {
+        // The 8-word budget is spent by rarity in `ask`, not by sentence
+        // position; tokenization must therefore hand back everything.
+        let q = "alpha bravo charlie delta echo foxtrot golf hotel india juliet";
+        assert_eq!(query_words(q).len(), 10);
+    }
+
+    #[test]
+    fn rarer_words_weigh_more() {
+        assert!(word_weight(Some(10)) > word_weight(Some(10_000)));
+        // A word the index cannot cost (`cd`, `rg` -- no indexable trigram)
+        // reads as None. That means "unknown", not "useless": `search()` reads
+        // the same None as "scan everything". It must not sink to the floor.
+        assert!(word_weight(None) > word_weight(Some(MAX_WORD_CANDIDATES)));
+        assert!(word_weight(None) < word_weight(Some(1)));
+    }
 }
